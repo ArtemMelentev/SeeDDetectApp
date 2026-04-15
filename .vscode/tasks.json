@@ -1,0 +1,16 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Start SeedDetect emulator",
+      "type": "shell",
+      "command": "$adb='C:\\Android\\Sdk\\platform-tools\\adb.exe'; $serial='emulator-5554'; $hasDevice = (& $adb devices | Select-String $serial); if (-not $hasDevice) { Start-Process 'C:\\Android\\Sdk\\emulator\\emulator.exe' -ArgumentList '-avd SeedDetect_API34 -netdelay none -netspeed full -no-snapshot-load' | Out-Null }; & $adb -s $serial wait-for-device | Out-Null; $boot=''; for ($i=0; $i -lt 120; $i++) { $boot = (& $adb -s $serial shell getprop sys.boot_completed 2>$null).Trim(); if ($boot -eq '1') { break }; Start-Sleep -Seconds 2 }; if ($boot -ne '1') { throw 'Emulator boot timeout (sys.boot_completed != 1)' }; & $adb -s $serial shell input keyevent 82 | Out-Null; & $adb -s $serial shell am force-stop com.google.android.documentsui 2>$null; & $adb -s $serial shell am force-stop com.android.documentsui 2>$null; & $adb -s $serial shell am start -a android.intent.action.MAIN -c android.intent.category.HOME | Out-Null",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      },
+      "problemMatcher": []
+    }
+  ]
+}

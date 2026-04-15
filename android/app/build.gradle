@@ -44,7 +44,7 @@ android {
     sourceSets {
         main {
             python.srcDir "src/main/python"
-            python.srcDir "../../"
+            python.srcDir "$buildDir/generated/chaquopy/python"
         }
     }
 }
@@ -61,8 +61,13 @@ chaquopy {
     }
 }
 
+tasks.register("prepareChaquopyPythonSources", Copy) {
+    from("../../segment_seeds_scan.py")
+    into("$buildDir/generated/chaquopy/python")
+}
+
 tasks.matching { it.name.startsWith("merge") && it.name.endsWith("PythonSources") }.configureEach {
-    doNotTrackState("Chaquopy source merge can hit Windows file-lock races during hashing")
+    dependsOn("prepareChaquopyPythonSources")
 }
 
 flutter {

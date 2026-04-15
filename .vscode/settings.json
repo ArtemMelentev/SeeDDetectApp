@@ -1,0 +1,8 @@
+{
+  "dart.flutterSdkPath": "C:\\Users\\Artem Melentyev\\source\\flutter",
+  "terminal.integrated.env.windows": {
+    "ANDROID_HOME": "C:\\Android\\Sdk",
+    "ANDROID_SDK_ROOT": "C:\\Android\\Sdk",
+    "JAVA_HOME": "C:\\Program Files\\Eclipse Adoptium\\jdk-17.0.18.8-hotspot"
+  }
+}

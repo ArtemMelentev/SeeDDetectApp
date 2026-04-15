@@ -17,6 +17,14 @@ Offline Android prototype with local Python execution for seed segmentation.
 4. Chaquopy executes `segment_seeds_scan.analyze_image(...)`.
 5. UI renders metrics and generated overlays/masks.
 
+## Running on Windows (Android emulator)
+
+Step-by-step checklist: `.kilo/plans/1776234800479-brave-planet.md`.
+
+Notes:
+- Current Chaquopy setup uses Python 3.10 on the build machine (`py -3.10 --version`).
+- ABI filters are currently set to `x86_64` for emulator-focused runs.
+
 ## Python entrypoint contract
 
 `analyze_image(input_path, output_dir) -> dict`

@@ -2,8 +2,9 @@ plugins {
     id "com.android.application"
     id "org.jetbrains.kotlin.android"
     id "dev.flutter.flutter-gradle-plugin"
-    id "com.chaquo.python"
 }
+
+apply plugin: "com.chaquo.python"
 
 android {
     namespace "com.seeddetect.app"
@@ -14,8 +15,15 @@ android {
         applicationId "com.seeddetect.app"
         minSdk 29
         targetSdk flutter.targetSdkVersion
-        versionCode flutter.versionCode
-        versionName flutter.versionName
+        versionCode 1
+        versionName "1.0"
+
+        // Chaquopy uses native components: package only required ABIs.
+        // Limit to x86_64 for the Windows emulator build path.
+        // arm64-v8a can be added later after verifying wheel availability.
+        ndk {
+            abiFilters "x86_64"
+        }
     }
 
     compileOptions {
@@ -43,12 +51,18 @@ android {
 
 chaquopy {
     defaultConfig {
-        version "3.11"
+        version "3.10"
+        buildPython("py", "-3.10")
         pip {
-            install "numpy==1.26.4"
-            install "opencv-python-headless==4.10.0.84"
+            options "--timeout", "120", "--retries", "20"
+            install "numpy==1.26.2"
+            install "opencv-python-headless==4.5.1.48"
         }
     }
+}
+
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("PythonSources") }.configureEach {
+    doNotTrackState("Chaquopy source merge can hit Windows file-lock races during hashing")
 }
 
 flutter {

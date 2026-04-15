@@ -1,3 +1,15 @@
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        // Required by Chaquopy 15.x during plugin initialization.
+        classpath "com.android.tools.build:gradle:8.3.2"
+        classpath "com.chaquo.python:gradle:15.0.1"
+    }
+}
+
 allprojects {
     repositories {
         google()

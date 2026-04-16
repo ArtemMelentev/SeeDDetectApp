@@ -23,7 +23,50 @@ Step-by-step checklist: `.kilo/plans/1776234800479-brave-planet.md`.
 
 Notes:
 - Current Chaquopy setup uses Python 3.10 on the build machine (`py -3.10 --version`).
-- ABI filters are currently set to `x86_64` for emulator-focused runs.
+- Chaquopy ABI filters are set to `x86_64` and `arm64-v8a` in `defaultConfig` to keep both emulator and phone support.
+
+## Phone release runbook (arm64-v8a)
+
+1. Create a local release keystore (example path: `android/app/upload-keystore.jks`).
+2. Create `android/key.properties` (file is ignored by git):
+
+```properties
+storePassword=<your-store-password>
+keyPassword=<your-key-password>
+keyAlias=<your-key-alias>
+storeFile=upload-keystore.jks
+```
+
+3. Build release APK for phone target:
+
+```bash
+flutter clean
+flutter pub get
+flutter build apk --release --target-platform android-arm64
+```
+
+4. Use the phone artifact:
+
+`build/app/outputs/flutter-apk/app-release.apk`
+
+5. Install on phone:
+
+```bash
+adb install -r build/app/outputs/flutter-apk/app-release.apk
+```
+
+6. Emulator regression after release changes:
+
+```bash
+flutter run -d <your_x86_64_emulator_id>
+```
+
+Smoke-check on emulator and phone: pick file -> wait for processing -> verify metrics and artifacts are shown.
+
+## Troubleshooting
+
+- Chaquopy timeout from `chaquo.com`: retry on stable network or VPN; if needed, use a local wheel cache and pass pip `--find-links`.
+- No wheel for selected ABI/Python/package pin: choose a compatible package version for current `chaquopy + python + abi` combination.
 
 ## Python entrypoint contract
 

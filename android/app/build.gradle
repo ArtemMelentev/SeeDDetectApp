@@ -6,10 +6,47 @@ plugins {
 
 apply plugin: "com.chaquo.python"
 
+import java.util.Properties
+
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file("key.properties")
+def hasReleaseSigningConfig = keystorePropertiesFile.exists()
+
+if (hasReleaseSigningConfig) {
+    keystorePropertiesFile.withInputStream { stream ->
+        keystoreProperties.load(stream)
+    }
+}
+
+def releaseTasksRequested = gradle.startParameter.taskNames.any { taskName ->
+    taskName.toLowerCase().contains("release")
+}
+
+def requiredKeystoreKeys = ["storeFile", "storePassword", "keyAlias", "keyPassword"]
+def missingKeystoreKeys = hasReleaseSigningConfig
+    ? requiredKeystoreKeys.findAll { key ->
+        !keystoreProperties.containsKey(key) || !keystoreProperties[key]?.toString()?.trim()
+    }
+    : requiredKeystoreKeys
+
+if (releaseTasksRequested && !hasReleaseSigningConfig) {
+    throw new GradleException("Release signing is not configured. Create android/key.properties with signing values before running release tasks.")
+}
+
+if (releaseTasksRequested && !missingKeystoreKeys.isEmpty()) {
+    throw new GradleException("android/key.properties is missing required keys: ${missingKeystoreKeys.join(', ')}")
+}
+
+def releaseStoreFilePath = hasReleaseSigningConfig ? keystoreProperties["storeFile"]?.toString() : null
+
+if (releaseTasksRequested && releaseStoreFilePath && !file(releaseStoreFilePath).exists()) {
+    throw new GradleException("Release keystore file not found: ${releaseStoreFilePath}")
+}
+
 android {
     namespace "com.seeddetect.app"
     compileSdk flutter.compileSdkVersion
-    ndkVersion flutter.ndkVersion
+    ndkVersion "25.1.8937393"
 
     defaultConfig {
         applicationId "com.seeddetect.app"
@@ -18,11 +55,10 @@ android {
         versionCode 1
         versionName "1.0"
 
-        // Chaquopy uses native components: package only required ABIs.
-        // Limit to x86_64 for the Windows emulator build path.
-        // arm64-v8a can be added later after verifying wheel availability.
+        // Chaquopy requires ABI filters in defaultConfig.
+        // Keep both emulator and phone paths available.
         ndk {
-            abiFilters "x86_64"
+            abiFilters "x86_64", "arm64-v8a"
         }
     }
 
@@ -35,9 +71,22 @@ android {
         jvmTarget = "17"
     }
 
+    signingConfigs {
+        if (hasReleaseSigningConfig) {
+            release {
+                keyAlias keystoreProperties["keyAlias"]
+                keyPassword keystoreProperties["keyPassword"]
+                storeFile file(releaseStoreFilePath)
+                storePassword keystoreProperties["storePassword"]
+            }
+        }
+    }
+
     buildTypes {
         release {
-            signingConfig signingConfigs.debug
+            if (hasReleaseSigningConfig) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 
@@ -55,6 +104,8 @@ chaquopy {
         buildPython("py", "-3.10")
         pip {
             options "--timeout", "120", "--retries", "20"
+            options "--find-links", "https://chaquo.com/pypi-13.1/numpy/"
+            options "--find-links", "https://chaquo.com/pypi-13.1/opencv-python-headless/"
             install "numpy==1.26.2"
             install "opencv-python-headless==4.5.1.48"
         }

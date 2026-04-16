@@ -11,6 +11,33 @@
         "clear": true
       },
       "problemMatcher": []
+    },
+    {
+      "label": "Run SeedDetect debug (emulator)",
+      "type": "shell",
+      "dependsOn": "Start SeedDetect emulator",
+      "command": "$flutter='C:\\Users\\Artem Melentyev\\source\\flutter\\bin\\flutter.bat'; $env:ANDROID_HOME='C:\\Android\\Sdk'; $env:ANDROID_SDK_ROOT='C:\\Android\\Sdk'; $env:JAVA_HOME='C:\\Program Files\\Eclipse Adoptium\\jdk-17.0.18.8-hotspot'; & $flutter run -d emulator-5554 --device-timeout 120",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Build SeedDetect release APK (phone)",
+      "type": "shell",
+      "command": "$flutter='C:\\Users\\Artem Melentyev\\source\\flutter\\bin\\flutter.bat'; $env:ANDROID_HOME='C:\\Android\\Sdk'; $env:ANDROID_SDK_ROOT='C:\\Android\\Sdk'; $env:JAVA_HOME='C:\\Program Files\\Eclipse Adoptium\\jdk-17.0.18.8-hotspot'; & $flutter clean; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; & $flutter pub get; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; & $flutter build apk --release --target-platform android-arm64",
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
     }
   ]
 }

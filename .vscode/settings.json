@@ -4,5 +4,27 @@
     "ANDROID_HOME": "C:\\Android\\Sdk",
     "ANDROID_SDK_ROOT": "C:\\Android\\Sdk",
     "JAVA_HOME": "C:\\Program Files\\Eclipse Adoptium\\jdk-17.0.18.8-hotspot"
+  },
+  "commands.workspaceCommands": {
+    "SeedDetect: Emulator Debug": {
+      "command": "workbench.action.tasks.runTask",
+      "args": "Run SeedDetect debug (emulator)",
+      "statusBar": {
+        "alignment": "left",
+        "text": "$(device-mobile) Seed Debug",
+        "tooltip": "Run emulator and start Flutter debug",
+        "priority": 1000
+      }
+    },
+    "SeedDetect: Build Release APK": {
+      "command": "workbench.action.tasks.runTask",
+      "args": "Build SeedDetect release APK (phone)",
+      "statusBar": {
+        "alignment": "left",
+        "text": "$(package) Build APK",
+        "tooltip": "Build phone release APK",
+        "priority": 999
+      }
+    }
   }
 }

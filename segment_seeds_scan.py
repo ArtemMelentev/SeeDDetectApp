@@ -328,6 +328,12 @@ def _error_payload(code: str, message: str, details=None):
     return payload
 
 
+def _safe_percent(numerator: int | float, denominator: int | float) -> float:
+    if denominator <= 0:
+        return 0.0
+    return float(numerator) * 100.0 / float(denominator)
+
+
 def analyze_image(input_path, output_dir, max_pixels=DEFAULT_MAX_PIXELS, max_side=DEFAULT_MAX_SIDE):
     """Analyze one image and return a structured payload for UI/native bridges."""
     started = time.perf_counter()
@@ -361,6 +367,14 @@ def analyze_image(input_path, output_dir, max_pixels=DEFAULT_MAX_PIXELS, max_sid
         except cv2.error as exc:
             return _error_payload("opencv_error", "OpenCV processing failed", str(exc))
 
+        all_seed_area_px = int(all_stats.get("all_seed_area_px", 0))
+        black_seed_area_px = int(blk_stats.get("black_seed_area_px", 0))
+        image_area_px = int(all_stats.get("image_area_px", 0))
+
+        all_seed_ratio_pct = _safe_percent(all_seed_area_px, image_area_px)
+        black_seed_ratio_pct = _safe_percent(black_seed_area_px, image_area_px)
+        black_to_all_seed_ratio_pct = _safe_percent(black_seed_area_px, all_seed_area_px)
+
         all_mask_path = output_dir / f"{stem}_all_mask.png"
         all_overlay_path = output_dir / f"{stem}_all_overlay.jpg"
         black_mask_path = output_dir / f"{stem}_black_mask.png"
@@ -389,6 +403,9 @@ def analyze_image(input_path, output_dir, max_pixels=DEFAULT_MAX_PIXELS, max_sid
             "processing_ms": processing_ms,
             **all_stats,
             **blk_stats,
+            "all_seed_ratio_pct": all_seed_ratio_pct,
+            "black_seed_ratio_pct": black_seed_ratio_pct,
+            "black_to_all_seed_ratio_pct": black_to_all_seed_ratio_pct,
             "preprocessing": prep,
             "artifacts": {
                 "all_mask": str(all_mask_path),
@@ -416,6 +433,9 @@ def process_image(image_path, output_dir):
         "all_seed_area_px": result["all_seed_area_px"],
         "black_seed_count": result["black_seed_count"],
         "black_seed_area_px": result["black_seed_area_px"],
+        "all_seed_ratio_pct": result["all_seed_ratio_pct"],
+        "black_seed_ratio_pct": result["black_seed_ratio_pct"],
+        "black_to_all_seed_ratio_pct": result["black_to_all_seed_ratio_pct"],
         "processing_ms": result["processing_ms"],
     }
 

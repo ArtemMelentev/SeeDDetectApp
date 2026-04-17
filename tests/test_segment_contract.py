@@ -28,7 +28,17 @@ class AnalyzeImageContractTest(unittest.TestCase):
             self.assertIn("all_seed_area_px", result)
             self.assertIn("black_seed_count", result)
             self.assertIn("black_seed_area_px", result)
+            self.assertIn("all_seed_ratio_pct", result)
+            self.assertIn("black_seed_ratio_pct", result)
+            self.assertIn("black_to_all_seed_ratio_pct", result)
             self.assertIn("processing_ms", result)
+
+            self.assertGreaterEqual(result["all_seed_ratio_pct"], 0.0)
+            self.assertLessEqual(result["all_seed_ratio_pct"], 100.0)
+            self.assertGreaterEqual(result["black_seed_ratio_pct"], 0.0)
+            self.assertLessEqual(result["black_seed_ratio_pct"], 100.0)
+            self.assertGreaterEqual(result["black_to_all_seed_ratio_pct"], 0.0)
+            self.assertLessEqual(result["black_to_all_seed_ratio_pct"], 100.0)
 
             artifacts = result.get("artifacts", {})
             self.assertTrue(Path(artifacts.get("all_mask", "")).exists())

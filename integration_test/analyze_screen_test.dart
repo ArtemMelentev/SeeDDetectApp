@@ -10,7 +10,7 @@ void main() {
     await tester.pumpWidget(const SeedDetectApp());
     await tester.pumpAndSettle();
 
-    expect(find.text('Select from gallery'), findsOneWidget);
-    expect(find.text('Select from files'), findsOneWidget);
+    expect(find.text('Выбрать из галереи'), findsOneWidget);
+    expect(find.text('Выбрать файл'), findsOneWidget);
   });
 }

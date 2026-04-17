@@ -11,11 +11,14 @@ Offline Android prototype with local Python execution for seed segmentation.
 
 ## Current flow (v1)
 
-1. User picks one image from gallery or file picker.
+1. User picks one image from gallery or selects an image/PDF from file picker.
 2. Flutter sends URI to Android platform channel.
-3. Kotlin copies file into app-internal cache run directory.
-4. Chaquopy executes `segment_seeds_scan.analyze_image(...)`.
-5. UI renders metrics and generated overlays/masks.
+3. Kotlin prepares input in app-internal cache run directory:
+   - non-PDF: file is copied as-is;
+   - PDF: embedded images are extracted with `pdfbox-android`.
+4. For PDF, validation rule is strict: exactly one embedded raster image must be found.
+5. Chaquopy executes `segment_seeds_scan.analyze_image(...)` with resulting image path.
+6. UI renders metrics and generated overlays/masks.
 
 ## Running on Windows (Android emulator)
 
@@ -74,10 +77,16 @@ Smoke-check on emulator and phone: pick file -> wait for processing -> verify me
 
 Response payload includes:
 
-- Metrics: `seed_count`, `all_seed_area_px`, `black_seed_count`, `black_seed_area_px`
+- Metrics: `seed_count`, `all_seed_area_px`, `black_seed_count`, `black_seed_area_px`, `all_seed_ratio_pct`, `black_seed_ratio_pct`, `black_to_all_seed_ratio_pct`
 - Service fields: `image_w`, `image_h`, `processing_ms`
 - Artifacts: absolute paths to all mask/overlay files
 - Error payload format: `{ "ok": false, "error": { "code", "message", "details?" } }`
+
+PDF-specific native error codes:
+
+- `pdf_image_not_found`: no embedded raster image found in PDF.
+- `pdf_multiple_images`: more than one embedded raster image found in PDF.
+- `pdf_extract_failed`: PDF parsing or extraction failed on Android side.
 
 ## Safety for large images
 

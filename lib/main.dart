@@ -49,12 +49,103 @@ class AnalyzeScreen extends StatefulWidget {
   State<AnalyzeScreen> createState() => _AnalyzeScreenState();
 }
 
-class _AnalyzeScreenState extends State<AnalyzeScreen> {
+class _AnalyzeScreenState extends State<AnalyzeScreen>
+    with WidgetsBindingObserver {
   final ImagePicker _imagePicker = ImagePicker();
 
   AnalyzeState _state = AnalyzeState.idle;
   Map<String, dynamic>? _result;
   String? _errorMessage;
+  bool _isConsumingSharedInput = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _consumeSharedInputFromPlatform();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _consumeSharedInputFromPlatform();
+    }
+  }
+
+  Future<void> _consumeSharedInputFromPlatform() async {
+    if (_isConsumingSharedInput || !mounted) {
+      return;
+    }
+
+    _isConsumingSharedInput = true;
+    try {
+      final raw = await _channel.invokeMethod<dynamic>('consumeSharedInput');
+      final normalized = _normalize(raw);
+      if (normalized is! Map<String, dynamic>) {
+        return;
+      }
+
+      final sharedUri = normalized['inputUri']?.toString();
+      if (sharedUri == null || sharedUri.isEmpty) {
+        return;
+      }
+
+      final notice = _buildSharedImportNotice(normalized);
+      if (mounted && notice != null && notice.isNotEmpty) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) {
+            return;
+          }
+
+          final messenger = ScaffoldMessenger.maybeOf(context);
+          messenger?.showSnackBar(SnackBar(content: Text(notice)));
+        });
+      }
+
+      await _runAnalysis(sharedUri);
+    } on MissingPluginException {
+      return;
+    } on PlatformException catch (exc) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _state = AnalyzeState.error;
+        _errorMessage = exc.message ?? 'Не удалось получить файл из шаринга';
+      });
+    } finally {
+      _isConsumingSharedInput = false;
+    }
+  }
+
+  String? _buildSharedImportNotice(Map<String, dynamic> payload) {
+    final summary = payload['summaryMessage']?.toString();
+    if (summary != null && summary.isNotEmpty) {
+      return summary;
+    }
+
+    final totalCount = int.tryParse(payload['totalCount']?.toString() ?? '') ?? 0;
+    final importedCount =
+        int.tryParse(payload['importedCount']?.toString() ?? '') ?? 0;
+    final failedCount = int.tryParse(payload['failedCount']?.toString() ?? '') ?? 0;
+
+    if (totalCount <= 1) {
+      return null;
+    }
+
+    if (failedCount > 0) {
+      return 'Импортировано $importedCount из $totalCount файлов. Открыт первый поддерживаемый файл.';
+    }
+
+    return 'Импортировано $importedCount файлов. Открыт первый файл.';
+  }
 
   Future<void> _pickFromGallery() async {
     setState(() {

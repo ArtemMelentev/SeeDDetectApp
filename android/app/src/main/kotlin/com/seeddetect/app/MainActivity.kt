@@ -1,7 +1,9 @@
 package com.seeddetect.app
 
+import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
+import android.os.Bundle
 import android.util.Log
 import android.webkit.MimeTypeMap
 import com.chaquo.python.Python
@@ -34,6 +36,19 @@ class MainActivity : FlutterActivity() {
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile
     private var pdfBoxInitialized = false
+    @Volatile
+    private var pendingSharedInput: Map<String, Any?>? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        captureSharedInput(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        captureSharedInput(intent)
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -42,6 +57,7 @@ class MainActivity : FlutterActivity() {
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "analyzeImage" -> handleAnalyze(call, result)
+                    "consumeSharedInput" -> result.success(consumeSharedInput())
                     else -> result.notImplemented()
                 }
             }
@@ -50,6 +66,52 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         ioScope.cancel()
         super.onDestroy()
+    }
+
+    private fun captureSharedInput(intent: Intent?) {
+        if (intent == null) {
+            return
+        }
+
+        val sharedInputUri = intent.getStringExtra(ShareIntentContract.EXTRA_SHARED_INPUT_URI)
+        if (sharedInputUri.isNullOrBlank()) {
+            return
+        }
+
+        val payload = mutableMapOf<String, Any?>(
+            "inputUri" to sharedInputUri,
+            "mimeType" to intent.getStringExtra(ShareIntentContract.EXTRA_SHARED_MIME_TYPE),
+            "displayName" to intent.getStringExtra(ShareIntentContract.EXTRA_SHARED_DISPLAY_NAME),
+            "sourceAction" to intent.getStringExtra(ShareIntentContract.EXTRA_SHARED_SOURCE_ACTION),
+            "totalCount" to intent.getIntExtra(ShareIntentContract.EXTRA_SHARED_TOTAL_COUNT, 1),
+            "importedCount" to intent.getIntExtra(ShareIntentContract.EXTRA_SHARED_IMPORTED_COUNT, 1),
+            "failedCount" to intent.getIntExtra(ShareIntentContract.EXTRA_SHARED_FAILED_COUNT, 0),
+            "summaryMessage" to intent.getStringExtra(ShareIntentContract.EXTRA_SHARED_SUMMARY_MESSAGE),
+        )
+
+        pendingSharedInput = payload
+        clearShareExtras(intent)
+        Log.i(
+            TAG,
+            "[Share][IMP:6][captureSharedInput][QUEUE][Flow] uri=$sharedInputUri imported=${payload["importedCount"]} total=${payload["totalCount"]} [INFO]",
+        )
+    }
+
+    private fun consumeSharedInput(): Map<String, Any?>? {
+        val payload = pendingSharedInput
+        pendingSharedInput = null
+        return payload
+    }
+
+    private fun clearShareExtras(intent: Intent) {
+        intent.removeExtra(ShareIntentContract.EXTRA_SHARED_INPUT_URI)
+        intent.removeExtra(ShareIntentContract.EXTRA_SHARED_MIME_TYPE)
+        intent.removeExtra(ShareIntentContract.EXTRA_SHARED_DISPLAY_NAME)
+        intent.removeExtra(ShareIntentContract.EXTRA_SHARED_SOURCE_ACTION)
+        intent.removeExtra(ShareIntentContract.EXTRA_SHARED_TOTAL_COUNT)
+        intent.removeExtra(ShareIntentContract.EXTRA_SHARED_IMPORTED_COUNT)
+        intent.removeExtra(ShareIntentContract.EXTRA_SHARED_FAILED_COUNT)
+        intent.removeExtra(ShareIntentContract.EXTRA_SHARED_SUMMARY_MESSAGE)
     }
 
     private fun handleAnalyze(call: MethodCall, result: MethodChannel.Result) {

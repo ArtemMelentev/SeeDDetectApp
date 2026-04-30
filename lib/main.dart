@@ -1,10 +1,13 @@
 import 'dart:io';
 
+import 'package:camera/camera.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
+
+import 'camera_capture_screen.dart';
 
 const _channel = MethodChannel('seed_detect/analyzer');
 
@@ -185,6 +188,57 @@ class _AnalyzeScreenState extends State<AnalyzeScreen>
     await _runAnalysis(uri);
   }
 
+  Future<void> _captureFromCamera() async {
+    setState(() {
+      _state = AnalyzeState.picking;
+      _errorMessage = null;
+    });
+
+    try {
+      final photo = await Navigator.of(context).push<XFile>(
+        MaterialPageRoute(builder: (_) => const CameraCaptureScreen()),
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      if (photo == null) {
+        setState(() => _state = AnalyzeState.idle);
+        return;
+      }
+
+      final uri = Uri.file(photo.path).toString();
+      await _runAnalysis(uri);
+    } on CameraException catch (exc) {
+      if (!mounted) {
+        return;
+      }
+
+      final message = switch (exc.code) {
+        'CameraAccessDenied' ||
+        'CameraAccessDeniedWithoutPrompt' ||
+        'CameraAccessRestricted' =>
+          'Доступ к камере отклонен. Разрешите его в настройках устройства.',
+        _ => 'Не удалось открыть камеру на устройстве.',
+      };
+
+      setState(() {
+        _state = AnalyzeState.error;
+        _errorMessage = message;
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _state = AnalyzeState.error;
+        _errorMessage = 'Не удалось открыть камеру на устройстве.';
+      });
+    }
+  }
+
   Future<void> _runAnalysis(String inputUri) async {
     setState(() {
       _state = AnalyzeState.processing;
@@ -291,6 +345,13 @@ class _AnalyzeScreenState extends State<AnalyzeScreen>
                         : _pickFromFiles,
                     icon: const Icon(Icons.folder_open),
                     label: const Text('Выбрать файл'),
+                  ),
+                  ElevatedButton.icon(
+                    onPressed: _state == AnalyzeState.processing
+                        ? null
+                        : _captureFromCamera,
+                    icon: const Icon(Icons.photo_camera),
+                    label: const Text('Сделать снимок'),
                   ),
                 ],
               ),

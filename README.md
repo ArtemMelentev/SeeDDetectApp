@@ -11,14 +11,19 @@ Offline Android prototype with local Python execution for seed segmentation.
 
 ## Current flow (v1)
 
-1. User picks one image from gallery or selects an image/PDF from file picker.
+1. User chooses one source: built-in camera (`Сделать снимок`), gallery, or file picker (image/PDF).
 2. Flutter sends URI to Android platform channel.
 3. Kotlin prepares input in app-internal cache run directory:
-   - non-PDF: file is copied as-is;
-   - PDF: embedded images are extracted with `pdfbox-android`.
+    - non-PDF: file is copied as-is;
+    - PDF: embedded images are extracted with `pdfbox-android`.
 4. For PDF, validation rule is strict: exactly one embedded raster image must be found.
 5. Chaquopy executes `segment_seeds_scan.analyze_image(...)` with resulting image path.
 6. UI renders metrics and generated overlays/masks.
+
+### Camera notes
+
+- Camera capture uses in-app preview (`camera`) with flash and zoom controls.
+- Android permission `CAMERA` is required; if access is denied, app shows a localized error and returns to the main screen.
 
 ## Running on Windows (Android emulator)
 
@@ -65,6 +70,15 @@ flutter run -d <your_x86_64_emulator_id>
 ```
 
 Smoke-check on emulator and phone: pick file -> wait for processing -> verify metrics and artifacts are shown.
+
+## Regression checklist
+
+- `Сделать снимок` opens camera screen.
+- Zoom works via slider and pinch gesture.
+- Flash mode toggle switches without app crash (unsupported mode shows message).
+- Capture closes camera screen and starts analysis on the new photo.
+- Permission denial path shows user-friendly message.
+- `Выбрать из галереи` and `Выбрать файл` still work as before.
 
 ## Troubleshooting
 

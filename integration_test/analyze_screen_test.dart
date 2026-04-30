@@ -12,5 +12,6 @@ void main() {
 
     expect(find.text('Выбрать из галереи'), findsOneWidget);
     expect(find.text('Выбрать файл'), findsOneWidget);
+    expect(find.text('Сделать снимок'), findsOneWidget);
   });
 }

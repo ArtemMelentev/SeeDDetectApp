@@ -9,6 +9,7 @@ void main() {
   testWidgets('App renders title', (tester) async {
     await tester.pumpWidget(const SeedDetectApp());
     expect(find.text('Seed Detect (офлайн)'), findsOneWidget);
+    expect(find.text('Сделать снимок'), findsOneWidget);
   });
 
   testWidgets('Shows localized message for pdf_multiple_images', (tester) async {

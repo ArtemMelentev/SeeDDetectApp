@@ -1,0 +1,10 @@
+# Template for android/local.properties
+#
+# Copy this file to android/local.properties on your machine.
+# Do not commit android/local.properties (it contains machine-specific paths).
+
+# Path to Flutter SDK root (directory which contains bin/flutter).
+flutter.sdk=C:\\path\\to\\flutter
+
+# Path to Android SDK root (directory which contains platform-tools, emulator, etc.).
+sdk.dir=C:\\path\\to\\Android\\Sdk

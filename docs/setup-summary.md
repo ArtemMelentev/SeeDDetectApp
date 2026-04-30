@@ -1,5 +1,7 @@
 # Summary: установка окружения для SeedDetectApp (Windows)
 
+Примечание: актуальные требования к SDK/инструментам теперь зафиксированы в `toolchain.yaml`, а переносимые инструкции и шаблоны локальных файлов находятся в `docs/environment.md`.
+
 - Flutter SDK: `C:\Users\Artem Melentyev\source\flutter` (установлен через `git clone`, использована версия `3.22.3`).
 - Android Studio: `C:\Program Files\Android\Android Studio` (установлена через `winget`).
 - Android SDK root: `C:\Android\Sdk` (перенесен из `%LOCALAPPDATA%` в путь без пробелов).

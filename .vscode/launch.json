@@ -5,8 +5,8 @@
       "name": "SeedDetect (One Click)",
       "request": "launch",
       "type": "node-terminal",
-      "preLaunchTask": "Start SeedDetect emulator",
-      "command": "$env:ANDROID_HOME='C:\\Android\\Sdk'; $env:ANDROID_SDK_ROOT='C:\\Android\\Sdk'; $env:JAVA_HOME='C:\\Program Files\\Eclipse Adoptium\\jdk-17.0.18.8-hotspot'; & 'C:\\Users\\Artem Melentyev\\source\\flutter\\bin\\flutter.bat' run -d emulator-5554 --device-timeout 120"
+      "preLaunchTask": "Run SeedDetect debug (emulator)",
+      "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"Write-Host 'Flutter run started by VS Code task: Run SeedDetect debug (emulator).'\""
     },
     {
       "name": "SeedDetect (Dart Extension)",
@@ -16,12 +16,7 @@
       "program": "lib/main.dart",
       "deviceId": "emulator-5554",
       "cwd": "${workspaceFolder}",
-      "preLaunchTask": "Start SeedDetect emulator",
-      "env": {
-        "ANDROID_HOME": "C:\\Android\\Sdk",
-        "ANDROID_SDK_ROOT": "C:\\Android\\Sdk",
-        "JAVA_HOME": "C:\\Program Files\\Eclipse Adoptium\\jdk-17.0.18.8-hotspot"
-      }
+      "preLaunchTask": "Start SeedDetect emulator"
     }
   ]
 }

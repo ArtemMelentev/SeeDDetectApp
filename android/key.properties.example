@@ -1,0 +1,11 @@
+# Template for android/key.properties
+#
+# Copy to android/key.properties and fill in real values.
+# IMPORTANT: do not commit android/key.properties (it contains secrets).
+
+storePassword=CHANGE_ME
+keyPassword=CHANGE_ME
+keyAlias=CHANGE_ME
+
+# Path to your keystore file (absolute or relative to the android/ directory).
+storeFile=C:\\path\\to\\release-keystore.jks

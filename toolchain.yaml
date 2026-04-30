@@ -1,0 +1,47 @@
+# SeedDetectApp toolchain requirements
+#
+# This file is the human-readable source of truth for required SDKs/tools
+# to develop and build this project on a new machine.
+
+flutter:
+  channel: stable
+  version: 3.22.3
+  # From pubspec.yaml
+  dart_sdk_constraint: ">=3.3.0 <4.0.0"
+
+android:
+  gradle_wrapper: "8.4"
+  android_gradle_plugin: "8.3.2"
+  kotlin_plugin: "1.9.22"
+  # compileSdk/targetSdk are resolved by Flutter (flutter.compileSdkVersion / flutter.targetSdkVersion)
+  min_sdk: 29
+  ndk_version: "25.1.8937393"
+  required_sdk_packages:
+    - platform-tools
+    - emulator
+    - "platforms;android-34"
+    - "build-tools;34.0.0"
+    - "system-images;android-34;google_apis;x86_64"
+  avd:
+    preferred: "SeedDetect_API34"
+    fallback: "first-available"
+
+java:
+  jdk: "17"
+
+python:
+  # Required by Chaquopy configuration in android/app/build.gradle
+  required_for_chaquopy: "3.10"
+  windows_launcher_example: "py -3.10"
+  # Local Python dependencies (for non-Android scripts/tools)
+  requirements_file: "requirements.txt"
+
+vscode_tasks:
+  start_emulator: "Start SeedDetect emulator"
+  debug_emulator: "Run SeedDetect debug (emulator)"
+  build_release_apk: "Build SeedDetect release APK (phone)"
+
+signing:
+  release_requires_signing: true
+  key_properties_path: "android/key.properties"
+  template: "android/key.properties.example"

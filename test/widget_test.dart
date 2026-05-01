@@ -24,6 +24,12 @@ void main() {
           },
         };
       }
+      if (call.method == 'saveImageToGallery') {
+        return {
+          'ok': true,
+          'savedUri': 'content://mock/saved',
+        };
+      }
       return null;
     });
 

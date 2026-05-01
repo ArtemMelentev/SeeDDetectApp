@@ -1,9 +1,11 @@
 package com.seeddetect.app
 
 import android.content.Intent
+import android.content.ContentValues
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Bundle
+import android.provider.MediaStore
 import android.util.Log
 import android.webkit.MimeTypeMap
 import com.chaquo.python.Python
@@ -58,6 +60,7 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "analyzeImage" -> handleAnalyze(call, result)
                     "consumeSharedInput" -> result.success(consumeSharedInput())
+                    "saveImageToGallery" -> handleSaveImageToGallery(call, result)
                     else -> result.notImplemented()
                 }
             }
@@ -134,6 +137,100 @@ class MainActivity : FlutterActivity() {
                 result.success(payload)
             }
         }
+    }
+
+    private fun handleSaveImageToGallery(call: MethodCall, result: MethodChannel.Result) {
+        val path = call.argument<String>("path")
+        val displayName = call.argument<String>("displayName")
+        if (path.isNullOrBlank()) {
+            result.success(errorPayload("invalid_args", "Missing path"))
+            return
+        }
+
+        ioScope.launch {
+            val payload = try {
+                saveImageToGallery(path, displayName)
+            } catch (exc: Exception) {
+                errorPayload(
+                    "gallery_save_failed",
+                    "Failed to save image to gallery",
+                    "${exc.javaClass.simpleName}: ${exc.message}",
+                )
+            }
+
+            withContext(Dispatchers.Main) {
+                result.success(payload)
+            }
+        }
+    }
+
+    private fun saveImageToGallery(path: String, displayName: String?): Map<String, Any?> {
+        val source = File(path)
+        if (!source.exists() || !source.isFile) {
+            return errorPayload("invalid_args", "Source file not found", path)
+        }
+        if (!source.canRead()) {
+            return errorPayload("invalid_args", "Source file is not readable", path)
+        }
+
+        val safeName = displayName?.takeIf { it.isNotBlank() }
+            ?: "SeedDetect_${System.currentTimeMillis()}${extensionForName(source.name)}"
+        val mimeType = guessMimeTypeFromName(safeName) ?: "image/jpeg"
+
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, safeName)
+            put(MediaStore.Images.Media.MIME_TYPE, mimeType)
+            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/SeedDetect")
+            put(MediaStore.Images.Media.IS_PENDING, 1)
+        }
+
+        val collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        val savedUri = contentResolver.insert(collection, values)
+            ?: return errorPayload("gallery_save_failed", "MediaStore insert failed")
+
+        try {
+            contentResolver.openOutputStream(savedUri)?.use { output ->
+                FileInputStream(source).use { input ->
+                    input.copyTo(output)
+                }
+            } ?: throw IOException("Cannot open output stream for $savedUri")
+
+            val done = ContentValues().apply {
+                put(MediaStore.Images.Media.IS_PENDING, 0)
+            }
+            contentResolver.update(savedUri, done, null, null)
+
+            return mapOf(
+                "ok" to true,
+                "savedUri" to savedUri.toString(),
+            )
+        } catch (exc: Exception) {
+            // Best-effort cleanup to avoid empty entries.
+            try {
+                contentResolver.delete(savedUri, null, null)
+            } catch (_: Exception) {
+                // ignore
+            }
+            throw exc
+        }
+    }
+
+    private fun guessMimeTypeFromName(name: String): String? {
+        val dot = name.lastIndexOf('.')
+        if (dot <= 0 || dot == name.lastIndex) {
+            return null
+        }
+        val ext = name.substring(dot + 1).lowercase(Locale.US)
+        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+    }
+
+    private fun extensionForName(name: String): String {
+        val dot = name.lastIndexOf('.')
+        if (dot <= 0 || dot == name.lastIndex) {
+            return ".jpg"
+        }
+        val ext = name.substring(dot + 1)
+        return ".${ext}"
     }
 
     private fun runAnalysis(inputUri: String): Map<String, Any?> {

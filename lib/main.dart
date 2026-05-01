@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:async';
 
 import 'package:camera/camera.dart';
 import 'package:file_picker/file_picker.dart';
@@ -55,6 +56,10 @@ class AnalyzeScreen extends StatefulWidget {
 class _AnalyzeScreenState extends State<AnalyzeScreen>
     with WidgetsBindingObserver {
   final ImagePicker _imagePicker = ImagePicker();
+
+  static const String _snackSavedToGalleryRu = 'Снимок сохранен в галерею';
+  static const String _snackFailedToSaveToGalleryRu =
+      'Снимок сделан, но сохранить в галерею не удалось.';
 
   AnalyzeState _state = AnalyzeState.idle;
   Map<String, dynamic>? _result;
@@ -208,6 +213,9 @@ class _AnalyzeScreenState extends State<AnalyzeScreen>
         return;
       }
 
+      // Best-effort: publish captured photo into MediaStore without blocking analysis.
+      unawaited(_saveCapturedPhotoToGallery(photo));
+
       final uri = Uri.file(photo.path).toString();
       await _runAnalysis(uri);
     } on CameraException catch (exc) {
@@ -236,6 +244,57 @@ class _AnalyzeScreenState extends State<AnalyzeScreen>
         _state = AnalyzeState.error;
         _errorMessage = 'Не удалось открыть камеру на устройстве.';
       });
+    }
+  }
+
+  Future<void> _saveCapturedPhotoToGallery(XFile photo) async {
+    final path = photo.path;
+    if (path.isEmpty) {
+      return;
+    }
+
+    final dotIndex = path.lastIndexOf('.');
+    final ext = (dotIndex >= 0 && dotIndex < path.length - 1)
+        ? path.substring(dotIndex + 1).toLowerCase()
+        : 'jpg';
+    final displayName = 'SeedDetect_${DateTime.now().millisecondsSinceEpoch}.$ext';
+
+    try {
+      final raw = await _channel.invokeMethod<dynamic>('saveImageToGallery', {
+        'path': path,
+        'displayName': displayName,
+      });
+
+      final normalized = _normalize(raw);
+      final ok = normalized is Map<String, dynamic> && normalized['ok'] == true;
+      if (!mounted) {
+        return;
+      }
+
+      final messenger = ScaffoldMessenger.maybeOf(context);
+      if (ok) {
+        messenger?.showSnackBar(const SnackBar(content: Text(_snackSavedToGalleryRu)));
+      } else {
+        messenger?.showSnackBar(
+          const SnackBar(content: Text(_snackFailedToSaveToGalleryRu)),
+        );
+      }
+    } on MissingPluginException {
+      return;
+    } on PlatformException {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+        const SnackBar(content: Text(_snackFailedToSaveToGalleryRu)),
+      );
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+        const SnackBar(content: Text(_snackFailedToSaveToGalleryRu)),
+      );
     }
   }
 

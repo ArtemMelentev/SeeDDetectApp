@@ -1,14 +1,11 @@
 import 'dart:io';
 import 'dart:async';
 
-import 'package:camera/camera.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
-
-import 'camera_capture_screen.dart';
 
 const _channel = MethodChannel('seed_detect/analyzer');
 
@@ -200,8 +197,9 @@ class _AnalyzeScreenState extends State<AnalyzeScreen>
     });
 
     try {
-      final photo = await Navigator.of(context).push<XFile>(
-        MaterialPageRoute(builder: (_) => const CameraCaptureScreen()),
+      final photo = await _imagePicker.pickImage(
+        source: ImageSource.camera,
+        preferredCameraDevice: CameraDevice.rear,
       );
 
       if (!mounted) {
@@ -218,18 +216,17 @@ class _AnalyzeScreenState extends State<AnalyzeScreen>
 
       final uri = Uri.file(photo.path).toString();
       await _runAnalysis(uri);
-    } on CameraException catch (exc) {
+    } on PlatformException catch (exc) {
       if (!mounted) {
         return;
       }
 
-      final message = switch (exc.code) {
-        'CameraAccessDenied' ||
-        'CameraAccessDeniedWithoutPrompt' ||
-        'CameraAccessRestricted' =>
-          'Доступ к камере отклонен. Разрешите его в настройках устройства.',
-        _ => 'Не удалось открыть камеру на устройстве.',
-      };
+      final message = (exc.code == 'camera_access_denied' ||
+              exc.code == 'photo_access_denied')
+          ? 'Доступ к камере отклонен. Разрешите его в настройках устройства.'
+          : (exc.message?.isNotEmpty == true
+              ? exc.message!
+              : 'Не удалось открыть камеру на устройстве.');
 
       setState(() {
         _state = AnalyzeState.error;

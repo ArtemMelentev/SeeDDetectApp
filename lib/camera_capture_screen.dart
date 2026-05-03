@@ -67,11 +67,23 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
 
       final controller = CameraController(
         selectedCamera,
-        ResolutionPreset.high,
+        ResolutionPreset.max,
         enableAudio: false,
       );
 
       await controller.initialize();
+
+      debugPrint(
+        '[CameraCapture] preset=max '
+        'camera=${controller.description.name} '
+        'lens=${controller.description.lensDirection} '
+        'sensor=${controller.description.sensorOrientation} '
+        'previewSize=${controller.value.previewSize} '
+        'aspectRatio=${controller.value.aspectRatio} '
+        'streaming=${controller.value.isStreamingImages} '
+        'recording=${controller.value.isRecordingVideo}',
+      );
+
       final minZoom = await controller.getMinZoomLevel();
       final maxZoom = await controller.getMaxZoomLevel();
 

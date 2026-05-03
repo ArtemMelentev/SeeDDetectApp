@@ -53,6 +53,32 @@ class AnalyzeImageContractTest(unittest.TestCase):
             self.assertFalse(result.get("ok"))
             self.assertEqual("file_not_found", result.get("error", {}).get("code"))
 
+    def test_photo_with_paper_background_produces_masks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_path = tmp_path / "photo.jpg"
+            out_dir = tmp_path / "out"
+
+            # Dark background + bright paper rectangle + a few dark seeds.
+            image = np.full((1600, 2400, 3), 30, dtype=np.uint8)
+            cv2.rectangle(image, (250, 180), (2150, 1420), (245, 245, 245), -1)
+            cv2.ellipse(image, (900, 720), (140, 70), 25, 0, 360, (25, 25, 25), -1)
+            cv2.ellipse(image, (1400, 880), (120, 55), -15, 0, 360, (55, 50, 45), -1)
+            cv2.ellipse(image, (1200, 560), (80, 45), 10, 0, 360, (15, 15, 15), -1)
+            ok = cv2.imwrite(str(input_path), image)
+            self.assertTrue(ok)
+
+            result = analyze_image(str(input_path), str(out_dir), max_pixels=1_200_000)
+            self.assertTrue(result.get("ok"))
+            self.assertGreaterEqual(int(result.get("seed_count", 0)), 1)
+            self.assertGreaterEqual(int(result.get("black_seed_count", 0)), 1)
+
+            artifacts = result.get("artifacts", {})
+            self.assertTrue(Path(artifacts.get("all_mask", "")).exists())
+            self.assertTrue(Path(artifacts.get("all_overlay", "")).exists())
+            self.assertTrue(Path(artifacts.get("black_mask", "")).exists())
+            self.assertTrue(Path(artifacts.get("black_overlay", "")).exists())
+
 
 if __name__ == "__main__":
     unittest.main()

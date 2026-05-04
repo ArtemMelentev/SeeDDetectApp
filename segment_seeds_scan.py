@@ -852,6 +852,65 @@ def _visualize_black_v2(img_bgr: np.ndarray, black_mask: np.ndarray, black_count
     return vis
 
 
+def _visualize_black_release(img_bgr: np.ndarray, black_contours: list) -> np.ndarray:
+    """Create release overlay: only subtle red crosses per black seed contour.
+
+    This visualization intentionally avoids mask pixelation, contour drawing, and any text,
+    leaving only small fixed-size markers centered on each detected black seed.
+    """
+    vis = img_bgr.copy()
+    h, w = vis.shape[:2]
+
+    # Small, weakly image-size-dependent marker.
+    marker_size = max(8, int(round(min(h, w) * 0.008)))
+    marker_size = min(marker_size, 18)
+    thickness = 1
+    color = (0, 0, 255)  # BGR red
+
+    marker_type = getattr(cv2, "MARKER_TILTED_CROSS", None)
+    if marker_type is None:
+        marker_type = getattr(cv2, "MARKER_CROSS", 0)
+
+    for cnt in black_contours or []:
+        try:
+            M = cv2.moments(cnt)
+        except Exception:
+            M = {"m00": 0}
+
+        if float(M.get("m00", 0.0)) > 0.0:
+            cx = int(round(float(M.get("m10", 0.0)) / float(M["m00"])))
+            cy = int(round(float(M.get("m01", 0.0)) / float(M["m00"])))
+        else:
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            cx = int(x + bw / 2.0)
+            cy = int(y + bh / 2.0)
+
+        cx = max(0, min(w - 1, cx))
+        cy = max(0, min(h - 1, cy))
+
+        if hasattr(cv2, "drawMarker"):
+            try:
+                cv2.drawMarker(
+                    vis,
+                    (cx, cy),
+                    color,
+                    markerType=marker_type,
+                    markerSize=int(marker_size),
+                    thickness=int(thickness),
+                    line_type=cv2.LINE_AA,
+                )
+                continue
+            except Exception:
+                pass
+
+        # Fallback if drawMarker is unavailable.
+        half = max(3, int(round(marker_size / 2.0)))
+        cv2.line(vis, (cx - half, cy - half), (cx + half, cy + half), color, thickness, cv2.LINE_AA)
+        cv2.line(vis, (cx - half, cy + half), (cx + half, cy - half), color, thickness, cv2.LINE_AA)
+
+    return vis
+
+
 # ──────────────────────────────────────────────────────────────────────
 #  Visualization helpers
 # ──────────────────────────────────────────────────────────────────────
@@ -975,6 +1034,7 @@ def analyze_image(
     max_side=DEFAULT_MAX_SIDE,
     do_shading: bool = DEFAULT_DO_SHADING,
     target_short: int = DEFAULT_TARGET_SHORT,
+    release_mode: bool = False,
 ):
     """Analyze one image and return a structured payload for UI/native bridges."""
     started = time.perf_counter()
@@ -1046,6 +1106,36 @@ def analyze_image(
         all_overlay_path = output_dir / f"{stem}_all_overlay.jpg"
         black_mask_path = output_dir / f"{stem}_black_mask.png"
         black_overlay_path = output_dir / f"{stem}_black_overlay.jpg"
+
+        if bool(release_mode):
+            try:
+                black_vis = _visualize_black_release(normalized, blk_cnt)
+                if not _safe_cv2_write(black_overlay_path, black_vis, ".jpg", quality=92):
+                    raise OSError(f"Cannot write visualization file: {black_overlay_path}")
+            except OSError as exc:
+                return _error_payload("write_error", "Cannot write black-seed overlay", str(exc))
+
+            processing_ms = int((time.perf_counter() - started) * 1000)
+            return {
+                "ok": True,
+                "image": str(input_path),
+                "image_w": int(image_w),
+                "image_h": int(image_h),
+                "processing_ms": processing_ms,
+                # Keep contract stable: only the existing metric keys are included.
+                "seed_count": int(all_stats.get("seed_count", 0)),
+                "all_seed_area_px": int(all_stats.get("all_seed_area_px", 0)),
+                "image_area_px": int(all_stats.get("image_area_px", 0)),
+                "black_seed_count": int(blk_stats.get("black_seed_count", 0)),
+                "black_seed_area_px": int(blk_stats.get("black_seed_area_px", 0)),
+                "all_seed_ratio_pct": all_seed_ratio_pct,
+                "black_seed_ratio_pct": black_seed_ratio_pct,
+                "black_to_all_seed_ratio_pct": black_to_all_seed_ratio_pct,
+                "preprocessing": prep,
+                "artifacts": {
+                    "black_overlay": str(black_overlay_path),
+                },
+            }
 
         if not _safe_cv2_write(all_mask_path, all_mask, ".png"):
             return _error_payload("write_error", f"Cannot write artifact: {all_mask_path}")

@@ -253,10 +253,12 @@ class MainActivity : FlutterActivity() {
 
         val py = Python.getInstance()
         val bridge = py.getModule("android_bridge")
+        val isRelease = !BuildConfig.DEBUG
         val jsonPayload = bridge.callAttr(
             "run_analysis_json",
             inputFile.absolutePath,
             runDir.absolutePath,
+            isRelease,
         ).toString()
 
         val payload = jsonObjectToMap(JSONObject(jsonPayload)).toMutableMap()

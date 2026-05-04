@@ -79,6 +79,30 @@ class AnalyzeImageContractTest(unittest.TestCase):
             self.assertTrue(Path(artifacts.get("black_mask", "")).exists())
             self.assertTrue(Path(artifacts.get("black_overlay", "")).exists())
 
+    def test_release_mode_writes_only_black_overlay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_path = tmp_path / "sample.jpg"
+            out_dir = tmp_path / "out"
+
+            # Simple synthetic: white paper background + one dark seed.
+            image = np.full((1400, 2000, 3), 255, dtype=np.uint8)
+            cv2.circle(image, (900, 700), 140, (20, 20, 20), -1)
+            ok = cv2.imwrite(str(input_path), image)
+            self.assertTrue(ok)
+
+            result = analyze_image(str(input_path), str(out_dir), max_pixels=1_200_000, release_mode=True)
+            self.assertTrue(result.get("ok"))
+
+            artifacts = result.get("artifacts", {})
+            self.assertEqual({"black_overlay"}, set(artifacts.keys()))
+            self.assertTrue(Path(artifacts.get("black_overlay", "")).exists())
+
+            stem = input_path.stem
+            self.assertFalse((out_dir / f"{stem}_all_mask.png").exists())
+            self.assertFalse((out_dir / f"{stem}_all_overlay.jpg").exists())
+            self.assertFalse((out_dir / f"{stem}_black_mask.png").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -48,6 +48,12 @@ android {
     compileSdk flutter.compileSdkVersion
     ndkVersion "25.1.8937393"
 
+    buildFeatures {
+        // BuildConfig is referenced from Kotlin code (MainActivity).
+        // Flutter's Gradle setup can disable BuildConfig generation; force-enable it.
+        buildConfig true
+    }
+
     defaultConfig {
         applicationId "com.seeddetect.app"
         minSdk 29

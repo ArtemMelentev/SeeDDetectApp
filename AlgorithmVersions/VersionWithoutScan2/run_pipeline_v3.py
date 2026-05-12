@@ -1,238 +1,39 @@
-"""Seed segmentation pipeline in library + CLI modes.
-
-Primary entrypoint for app integration:
-    analyze_image(input_path, output_dir) -> dict
-"""
+#!/usr/bin/env python3
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
-import os
-import time
 from pathlib import Path
 
 import cv2
 import numpy as np
 
 
-SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
-DEFAULT_MAX_PIXELS = 12_000_000
-DEFAULT_MAX_SIDE = 4096
-
-# v3 pipeline defaults (see AlgorithmVersions/VersionWithoutScan2/run_pipeline_v3.py)
-DEFAULT_DO_SHADING = True
-DEFAULT_TARGET_SHORT = 2400
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 
 
-# ──────────────────────────────────────────────────────────────────────
-#  Legacy scan segmentation (kept for reference/backward compatibility)
-# ──────────────────────────────────────────────────────────────────────
-
-def _segment_all_seeds_legacy(img, edge_margin=10, dilation_k=51, diff_thresh=15):
-    """
-    Detect every seed on a white scan background.
-
-    Uses morphological dilation to estimate local background brightness,
-    then flags pixels noticeably darker than that background.
-    A saturation filter rejects colorless bright pixels (pure-white gaps).
-    Bright boundary removal surgically strips inter-seed gap leakage.
-    """
-    h, w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    sat = hsv[:, :, 1]
-
-    roi = np.zeros((h, w), dtype=np.uint8)
-    roi[edge_margin:h - edge_margin, edge_margin:w - edge_margin] = 255
-
-    # Local background estimation
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilation_k, dilation_k))
-    local_bg = cv2.dilate(gray, k).astype(np.float32)
-    diff = local_bg - gray.astype(np.float32)
-
-    seed_raw = ((diff > diff_thresh) & (roi > 0)).astype(np.uint8) * 255
-
-    # Saturation filter: pure-white gaps are colorless (S < 8) and bright (gray > 200).
-    # Real seeds always carry some hue (beige, brown, grey-striped).
-    seed_raw[(sat < 8) & (gray > 200)] = 0
-
-    # Secondary: adaptive threshold catches subtle edges of light seeds
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    adapt = cv2.adaptiveThreshold(
-        blurred, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        blockSize=61, C=8,
-    )
-    adapt = cv2.bitwise_and(adapt, roi)
-
-    k_dilate_bridge = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    diff_dilated = cv2.dilate(seed_raw, k_dilate_bridge)
-    adapt_bridged = cv2.bitwise_and(adapt, diff_dilated)
-
-    combined = cv2.bitwise_or(seed_raw, adapt_bridged)
-
-    # Morphological cleanup — small close fills 1-2 px texture gaps within seeds
-    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    cleaned = cv2.morphologyEx(combined, cv2.MORPH_OPEN, k_open, iterations=1)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, k_close, iterations=1)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, k_open, iterations=1)
-
-    # Remove bright boundary pixels — inter-seed gaps that still leaked through.
-    # Interior bright pixels (specular highlights on seeds) are preserved.
-    BRIGHT_BOUNDARY_THRESH = 225
-    k_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    interior = cv2.erode(cleaned, k_erode)
-    bright_boundary = (gray > BRIGHT_BOUNDARY_THRESH) & (cleaned > 0) & (interior == 0)
-    cleaned[bright_boundary] = 0
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, k_open, iterations=1)
-
-    # Remove tiny noise blobs and faint background artifacts
-    min_area = max(60, h * w * 0.00004)
-    n_labels, labels, comp_stats, _ = cv2.connectedComponentsWithStats(cleaned)
-    remove_mask = np.zeros((h, w), dtype=np.uint8)
-    for lbl in range(1, n_labels):
-        area = comp_stats[lbl, cv2.CC_STAT_AREA]
-        if area < min_area:
-            remove_mask[labels == lbl] = 255
-            continue
-        comp_pixels = (labels == lbl)
-        mean_gray = float(gray[comp_pixels].mean())
-        if mean_gray > 220:
-            remove_mask[labels == lbl] = 255
-    result = cv2.bitwise_and(cleaned, cv2.bitwise_not(remove_mask))
-
-    # Contours for visualization only
-    contours, _ = cv2.findContours(result, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    return result, contours, {
-        "seed_count": len(contours),
-        "all_seed_area_px": int(np.sum(result > 0)),
-        "image_area_px": h * w,
-    }
+def imread(path: Path) -> np.ndarray | None:
+    data = np.fromfile(str(path), dtype=np.uint8)
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
 
-# ──────────────────────────────────────────────────────────────────────
-#  Pass 2 — black (unshelled / partially unshelled) seeds only
-# ──────────────────────────────────────────────────────────────────────
-
-def _segment_black_seeds_legacy(img, all_mask=None, edge_margin=10):
-    """
-    Detect dark / unshelled seeds (including partially peeled ones).
-
-    Core-grow strategy with shadow rejection:
-      1. Very dark core pixels (L < 75), cleaned gently
-      2. Grow into semi-dark zone (L < 95), restricted to all_mask
-      3. Trim boundary pixels brighter than L=85
-      4. Reject components with low fill ratio (shadow sprawl)
-         and insufficient dark-core fraction
-    """
-    h, w = img.shape[:2]
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l_ch = lab[:, :, 0].astype(np.float32)
-
-    roi = np.zeros((h, w), dtype=np.uint8)
-    roi[edge_margin:h - edge_margin, edge_margin:w - edge_margin] = 255
-
-    L_CORE = 75
-    L_SEMI = 95
-
-    # Stronger opening on core removes thin inter-seed shadow lines
-    core = ((l_ch < L_CORE) & (roi > 0)).astype(np.uint8) * 255
-    k_open_core = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    k_open_sm = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    core_clean = cv2.morphologyEx(core, cv2.MORPH_OPEN, k_open_core, iterations=1)
-
-    semi_constraint = (l_ch < L_SEMI) & (roi > 0)
-    if all_mask is not None:
-        semi_constraint = semi_constraint & (all_mask > 0)
-    semi = semi_constraint.astype(np.uint8) * 255
-
-    grown = core_clean.copy()
-    k_grow = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    for _ in range(15):
-        expanded = cv2.dilate(grown, k_grow, iterations=1)
-        expanded = cv2.bitwise_and(expanded, semi)
-        if np.array_equal(expanded, grown):
-            break
-        grown = expanded
-
-    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    grown = cv2.morphologyEx(grown, cv2.MORPH_CLOSE, k_close, iterations=1)
-
-    # Trim boundary pixels brighter than L=85 (shadow fringes)
-    k_erode_blk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    blk_interior = cv2.erode(grown, k_erode_blk)
-    bright_blk_edge = (l_ch > 85) & (grown > 0) & (blk_interior == 0)
-    grown[bright_blk_edge] = 0
-    grown = cv2.morphologyEx(grown, cv2.MORPH_OPEN, k_open_sm, iterations=1)
-
-    CORE_MIN = 0.15
-
-    n_labels, labels, comp_stats, _ = cv2.connectedComponentsWithStats(grown)
-    result = np.zeros((h, w), dtype=np.uint8)
-    for lbl in range(1, n_labels):
-        area = comp_stats[lbl, cv2.CC_STAT_AREA]
-        comp_pixels = (labels == lbl)
-        mean_l = float(l_ch[comp_pixels].mean())
-        core_frac = float((l_ch[comp_pixels] < L_CORE).sum()) / area
-
-        # Brightness-adaptive minimum area: dark seeds can be small,
-        # lighter fragments need to be larger to be trustworthy
-        if mean_l < 40:
-            min_area = 100
-        elif mean_l < 55:
-            min_area = 200
-        elif mean_l < 65:
-            min_area = 350
-        else:
-            min_area = 500
-
-        if area < min_area:
-            continue
-        if core_frac < CORE_MIN:
-            continue
-
-        blob_w = comp_stats[lbl, cv2.CC_STAT_WIDTH]
-        blob_h = comp_stats[lbl, cv2.CC_STAT_HEIGHT]
-        aspect = min(blob_w, blob_h) / max(blob_w, blob_h) if max(blob_w, blob_h) > 0 else 1
-        fill = area / (blob_w * blob_h) if blob_w * blob_h > 0 else 0
-
-        if mean_l < 65 and aspect < 0.06:
-            continue
-        if mean_l >= 65 and aspect < 0.10:
-            continue
-
-        # Reject shadow sprawl (low fill ratio = thin/scattered shape)
-        if fill < 0.20:
-            continue
-        if mean_l > 55 and fill < 0.30:
-            continue
-
-        result[labels == lbl] = 255
-
-    contours, _ = cv2.findContours(result, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    return result, contours, {
-        "black_seed_count": len(contours),
-        "black_seed_area_px": int(np.sum(result > 0)),
-    }
+def imwrite(path: Path, img: np.ndarray, params: list[int] | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ok, encoded = cv2.imencode(path.suffix, img, params or [])
+    if not ok:
+        raise RuntimeError(f"cannot encode {path}")
+    encoded.tofile(str(path))
 
 
-# ──────────────────────────────────────────────────────────────────────
-#  v3 helpers (paper+warp pipeline without GUI/CLI)
-# ──────────────────────────────────────────────────────────────────────
-
-
-def _odd(value: int | float, minimum: int = 3) -> int:
+def odd(value: int | float, minimum: int = 3) -> int:
     out = max(minimum, int(round(value)))
     return out | 1
 
 
-def _fill_holes(mask_u8: np.ndarray) -> np.ndarray:
+def fill_holes(mask_u8: np.ndarray) -> np.ndarray:
     h, w = mask_u8.shape
     inv = cv2.bitwise_not(mask_u8)
     pad = cv2.copyMakeBorder(inv, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=255)
@@ -242,7 +43,7 @@ def _fill_holes(mask_u8: np.ndarray) -> np.ndarray:
     return cv2.bitwise_or(mask_u8, holes)
 
 
-def _largest_component(mask_u8: np.ndarray) -> tuple[np.ndarray, int]:
+def largest_component(mask_u8: np.ndarray) -> tuple[np.ndarray, int]:
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
     if n <= 1:
         return np.zeros_like(mask_u8), 0
@@ -251,7 +52,7 @@ def _largest_component(mask_u8: np.ndarray) -> tuple[np.ndarray, int]:
     return comp, int(stats[idx, cv2.CC_STAT_AREA])
 
 
-def _component_bbox(mask_u8: np.ndarray) -> tuple[int, int, int, int]:
+def component_bbox(mask_u8: np.ndarray) -> tuple[int, int, int, int]:
     pts = cv2.findNonZero(mask_u8)
     if pts is None:
         return 0, 0, mask_u8.shape[1], mask_u8.shape[0]
@@ -259,18 +60,17 @@ def _component_bbox(mask_u8: np.ndarray) -> tuple[int, int, int, int]:
 
 
 def _score_paper_component(comp: np.ndarray, h: int, w: int) -> tuple[float, dict]:
-    """Score a candidate paper component by size/fill/border touches (v3)."""
     area = int((comp > 0).sum())
     img_area = float(h * w)
     if area <= 0:
         return -1.0, {"area": 0}
     frac = area / img_area
-    x, y, bw, bh = _component_bbox(comp)
+    x, y, bw, bh = component_bbox(comp)
     bbox_area = max(1, bw * bh)
     fill = area / float(bbox_area)
     touches = int(x <= 2) + int(y <= 2) + int(x + bw >= w - 2) + int(y + bh >= h - 2)
-
     score = 0.0
+    # Strong preference for large but not whole-frame components.
     if 0.20 <= frac <= 0.92:
         score += 0.6 + 0.4 * (1.0 - abs(0.6 - frac))
     else:
@@ -280,7 +80,6 @@ def _score_paper_component(comp: np.ndarray, h: int, w: int) -> tuple[float, dic
         score -= 0.8
     elif touches == 3:
         score -= 0.25
-
     info = {
         "area_frac_raw": round(frac, 4),
         "bbox_fill_raw": round(fill, 4),
@@ -313,10 +112,14 @@ def _quad_from_contour(contour: np.ndarray) -> np.ndarray | None:
 
 
 def _line_from_points(pts: np.ndarray) -> tuple[float, float, float] | None:
-    """Fit a line ax+by+c=0 (||(a,b)||=1) to Nx2 points via cv2.fitLine."""
+    """Fit a line ax+by+c=0 (||(a,b)||=1) to Nx2 points via cv2.fitLine.
+
+    Returns None if too few points.
+    """
     if pts.shape[0] < 8:
         return None
     vx, vy, x0, y0 = cv2.fitLine(pts.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01).reshape(-1)
+    # Normal to direction (vx,vy) is (-vy, vx). Line: -vy*(x-x0) + vx*(y-y0) = 0
     a = -float(vy)
     b = float(vx)
     c = -(a * float(x0) + b * float(y0))
@@ -333,13 +136,29 @@ def _intersect_lines(l1: tuple[float, float, float], l2: tuple[float, float, flo
     det = a1 * b2 - a2 * b1
     if abs(det) < 1e-6:
         return None
+    # Solve [[a1,b1],[a2,b2]] @ [x,y] = [-c1,-c2]
     x = (b1 * c2 - b2 * c1) / det
     y = (a2 * c1 - a1 * c2) / det
     return np.array([x, y], dtype=np.float32)
 
 
 def _quad_from_paper_edges(comp_mask: np.ndarray) -> tuple[np.ndarray | None, str]:
-    """Hybrid quadrilateral fit: minAreaRect base + per-side line refit (v3)."""
+    """Hybrid quadrilateral fit: minAreaRect base + per-side line refit.
+
+    Algorithm:
+      1. Convex hull of the paper component (skips concavities from bridges
+         into the wood table).
+      2. Densify hull edges into a dense point cloud and tag each point as
+         on-frame (lies on image border, i.e. paper runs off the photo) or
+         off-frame (a real paper edge).
+      3. Base quad = minAreaRect(hull). Its 4 sides give base line equations
+         and a stable orientation, even when one side is fully cut off.
+      4. For each of the 4 sides, assign off-frame hull points to that side
+         (nearest-line + half-plane + orientation constraints) and refit
+         the line if there are enough such points; otherwise keep the base
+         line. K-means-like: 4 iterations.
+      5. Intersect adjacent (refined) lines to produce the 4 corners.
+    """
     contours, _ = cv2.findContours(comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
         return None, "no_contour"
@@ -351,6 +170,7 @@ def _quad_from_paper_edges(comp_mask: np.ndarray) -> tuple[np.ndarray | None, st
         return None, "tiny_hull"
     H, W = comp_mask.shape
     border_eps = 3
+    all_pts: list[np.ndarray] = []
     off_pts: list[np.ndarray] = []
     for i in range(hull.shape[0]):
         a = hull[i, 0].astype(np.float32)
@@ -365,32 +185,38 @@ def _quad_from_paper_edges(comp_mask: np.ndarray) -> tuple[np.ndarray | None, st
             | (seg[:, 1] <= border_eps)
             | (seg[:, 1] >= H - 1 - border_eps)
         )
+        all_pts.append(seg)
         seg_off = seg[~on_frame]
         if seg_off.shape[0] > 0:
             off_pts.append(seg_off)
+    if not all_pts:
+        return None, "no_hull_pts"
+    pts_all = np.concatenate(all_pts, axis=0)
     pts_off = np.concatenate(off_pts, axis=0) if off_pts else np.zeros((0, 2), dtype=np.float32)
 
+    # Base = minAreaRect of the hull (stable; works even with one side cut).
     rect = cv2.minAreaRect(hull)
     box = cv2.boxPoints(rect).astype(np.float32)
-    box = _order_quad(box)
+    box = _order_quad(box)  # TL, TR, BR, BL
     tl, tr, br, bl = box[0], box[1], box[2], box[3]
 
     def _line_through(p: np.ndarray, q: np.ndarray) -> tuple[float, float, float]:
+        # Line from two points: normal = perpendicular to (q - p).
         dx = float(q[0] - p[0])
         dy = float(q[1] - p[1])
-        a_ = -dy
-        b_ = dx
-        c_ = -(a_ * float(p[0]) + b_ * float(p[1]))
-        n_ = float(np.hypot(a_, b_))
-        if n_ < 1e-9:
+        a = -dy
+        b = dx
+        c = -(a * float(p[0]) + b * float(p[1]))
+        n = float(np.hypot(a, b))
+        if n < 1e-9:
             return 1.0, 0.0, -float(p[0])
-        return a_ / n_, b_ / n_, c_ / n_
+        return a / n, b / n, c / n
 
     base_lines = [
-        _line_through(tl, tr),
-        _line_through(tr, br),
-        _line_through(br, bl),
-        _line_through(bl, tl),
+        _line_through(tl, tr),  # 0 top
+        _line_through(tr, br),  # 1 right
+        _line_through(br, bl),  # 2 bottom
+        _line_through(bl, tl),  # 3 left
     ]
 
     bx, by, bw, bh = cv2.boundingRect(hull)
@@ -398,13 +224,14 @@ def _quad_from_paper_edges(comp_mask: np.ndarray) -> tuple[np.ndarray | None, st
         return None, "thin_bbox"
 
     def _signed_dist(line: tuple[float, float, float], p: np.ndarray) -> np.ndarray:
-        a_, b_, c_ = line
-        return a_ * p[:, 0] + b_ * p[:, 1] + c_
+        a, b, c = line
+        return a * p[:, 0] + b * p[:, 1] + c
 
     def _is_horizontal(line: tuple[float, float, float]) -> bool:
-        a_, b_, _ = line
-        return abs(b_) > abs(a_)
+        a, b, _ = line
+        return abs(b) > abs(a)
 
+    # Per-side refit: only refit a side if enough off-frame points fall on it.
     min_side_pts = 25
     lines = list(base_lines)
     refits: list[bool] = [False, False, False, False]
@@ -412,14 +239,14 @@ def _quad_from_paper_edges(comp_mask: np.ndarray) -> tuple[np.ndarray | None, st
         cx_box, cy_box = box.mean(axis=0)
         for _ in range(4):
             dists = np.stack([np.abs(_signed_dist(line, pts_off)) for line in lines], axis=1)
-            cy_ = pts_off[:, 1]
-            cx_ = pts_off[:, 0]
+            cy = pts_off[:, 1]
+            cx = pts_off[:, 0]
             big = 1e9
             masked = dists.copy()
-            masked[cy_ > cy_box, 0] = big
-            masked[cx_ < cx_box, 1] = big
-            masked[cy_ < cy_box, 2] = big
-            masked[cx_ > cx_box, 3] = big
+            masked[cy > cy_box, 0] = big
+            masked[cx < cx_box, 1] = big
+            masked[cy < cy_box, 2] = big
+            masked[cx > cx_box, 3] = big
             labels = np.argmin(masked, axis=1)
 
             new_lines: list[tuple[float, float, float]] = []
@@ -430,6 +257,7 @@ def _quad_from_paper_edges(comp_mask: np.ndarray) -> tuple[np.ndarray | None, st
                     new_lines.append(base_lines[k])
                     new_refits.append(False)
                     continue
+                # Drop outliers (>3*MAD from base line) before refit.
                 base_d = np.abs(_signed_dist(base_lines[k], sel))
                 med = float(np.median(base_d))
                 mad = float(np.median(np.abs(base_d - med))) + 1e-6
@@ -443,14 +271,16 @@ def _quad_from_paper_edges(comp_mask: np.ndarray) -> tuple[np.ndarray | None, st
                     new_lines.append(base_lines[k])
                     new_refits.append(False)
                     continue
+                # Orientation must match the base side.
                 if _is_horizontal(line) != _is_horizontal(base_lines[k]):
                     new_lines.append(base_lines[k])
                     new_refits.append(False)
                     continue
+                # Angle deviation from base must be small (<= ~12 deg).
                 a0, b0, _ = base_lines[k]
                 a1, b1, _ = line
                 cos_ab = abs(a0 * a1 + b0 * b1)
-                if cos_ab < 0.978:
+                if cos_ab < 0.978:  # ~12 deg
                     new_lines.append(base_lines[k])
                     new_refits.append(False)
                     continue
@@ -479,6 +309,7 @@ def _quad_from_paper_edges(comp_mask: np.ndarray) -> tuple[np.ndarray | None, st
     quad = np.stack([p_tl, p_tr, p_br, p_bl], axis=0).astype(np.float32)
     quad = _order_quad(quad)
 
+    # Sanity vs hull (should not deviate wildly).
     hull_area = float(abs(cv2.contourArea(hull)))
     quad_area = float(abs(cv2.contourArea(quad)))
     if hull_area <= 0 or quad_area <= 0:
@@ -494,7 +325,8 @@ def _quad_from_paper_edges(comp_mask: np.ndarray) -> tuple[np.ndarray | None, st
         return None, "centroid_far"
 
     n_refit = sum(1 for r in refits if r)
-    return quad, f"hybrid_refit{n_refit}of4"
+    status = f"hybrid_refit{n_refit}of4"
+    return quad, status
 
 
 def _moving_average_1d(vals: np.ndarray, k: int) -> np.ndarray:
@@ -521,7 +353,13 @@ def _first_paper_run(paper_like: np.ndarray, max_scan: int) -> int:
 
 
 def _refine_quad_by_border_color(img_bgr: np.ndarray, quad: np.ndarray) -> tuple[np.ndarray, dict]:
-    """Trim table-coloured margins from an already-detected paper quad (v3)."""
+    """Trim table-coloured margins from an already-detected paper quad.
+
+    The cyan field detector gives a good orientation, but a few pixels of
+    saturated table can remain inside the quad. Work in the rectified quad so
+    each side is a simple 1D colour-profile problem, then map the inset rect
+    back through the inverse perspective transform.
+    """
     quad = _order_quad(quad)
     tl, tr, br, bl = quad
     out_w = int(max(8.0, round(max(float(np.linalg.norm(br - bl)), float(np.linalg.norm(tr - tl))))))
@@ -549,6 +387,8 @@ def _refine_quad_by_border_color(img_bgr: np.ndarray, quad: np.ndarray) -> tuple
     s_max = max(55.0, min(92.0, ref_s + 45.0))
     c_max = max(26.0, min(48.0, ref_c + 28.0))
 
+    # Use the central cross-section for each side so side-table leakage does
+    # not bias top/bottom scans, and vice versa.
     xs0, xs1 = int(out_w * 0.08), int(out_w * 0.92)
     ys0, ys1 = int(out_h * 0.08), int(out_h * 0.92)
     xs = slice(xs0, max(xs0 + 1, xs1))
@@ -561,7 +401,7 @@ def _refine_quad_by_border_color(img_bgr: np.ndarray, quad: np.ndarray) -> tuple
     col_s = np.median(sat[ys, :], axis=0)
     col_c = np.median(chroma[ys, :], axis=0)
 
-    smooth_k = max(3, min(15, _odd(min(out_w, out_h) * 0.004, 3)))
+    smooth_k = max(3, min(15, odd(min(out_w, out_h) * 0.004, 3)))
     row_l = _moving_average_1d(row_l, smooth_k)
     row_s = _moving_average_1d(row_s, smooth_k)
     row_c = _moving_average_1d(row_c, smooth_k)
@@ -610,6 +450,15 @@ def _refine_quad_by_border_color(img_bgr: np.ndarray, quad: np.ndarray) -> tuple
 
 
 def _cyan_field_mask(img_work: np.ndarray) -> tuple[np.ndarray, dict]:
+    """Segment the light-cyan paper field directly via LAB colour.
+
+    The cyan sheet is bright (L>140), cool (b<-2) and slightly green-cyan
+    (a<+2). Wood table: dark, warm. Beige backing paper: bright but warm
+    (b>0). White/grey miscellaneous paper scraps: b near zero.
+
+    Pre-process with bilateral on a downscale to suppress seed/wood texture
+    so the cyan sheet remains a single connected component after morph.
+    """
     h, w = img_work.shape[:2]
     pp_short = 600
     short = min(h, w)
@@ -625,6 +474,9 @@ def _cyan_field_mask(img_work: np.ndarray) -> tuple[np.ndarray, dict]:
     b = lab[:, :, 2].astype(np.float32) - 128.0
     sh, sw = L.shape
 
+    # Cyan sheet vs beige backing: bright (L>150), nearly neutral or slightly
+    # green (a<2), and noticeably less yellow than beige (b<12). Beige
+    # backing has a around +5..+10 and b around +15..+25.
     cyan_raw = ((L > 150.0) & (a < 2.0) & (b < 12.0)).astype(np.uint8) * 255
     raw_frac = float((cyan_raw > 0).sum()) / float(sh * sw)
     info = {"cyan_raw_frac": round(raw_frac, 4)}
@@ -632,13 +484,17 @@ def _cyan_field_mask(img_work: np.ndarray) -> tuple[np.ndarray, dict]:
         return np.zeros((h, w), dtype=np.uint8), info
 
     diag_s = float(np.hypot(sh, sw))
-    open_k = _odd(diag_s * 0.006, 5)
-    close_seed_k = _odd(diag_s * 0.020, 9)
-    close_final_k = _odd(diag_s * 0.060, 21)
+    open_k = odd(diag_s * 0.006, 5)
+    close_seed_k = odd(diag_s * 0.020, 9)   # bridge across seed gaps inside the sheet
+    close_final_k = odd(diag_s * 0.060, 21)
     open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k, open_k))
     close_seed_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_seed_k, close_seed_k))
     close_final_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_final_k, close_final_k))
 
+    # Pass 1: gentle close to bridge cyan around individual seeds, then keep
+    # the connected component that contains the image centre. This isolates
+    # the cyan sheet from any unrelated cool-bright blobs (white paper
+    # scraps, glare on the table, etc.) before we do the aggressive close.
     field1 = cv2.morphologyEx(cyan_raw, cv2.MORPH_CLOSE, close_seed_kernel, iterations=1)
     field1 = cv2.morphologyEx(field1, cv2.MORPH_OPEN, open_kernel, iterations=1)
     n1, labels1, stats1, _ = cv2.connectedComponentsWithStats(field1, connectivity=8)
@@ -652,8 +508,10 @@ def _cyan_field_mask(img_work: np.ndarray) -> tuple[np.ndarray, dict]:
             idx = 1 + int(np.argmax(stats1[1:, cv2.CC_STAT_AREA]))
             sheet_only = (labels1 == idx).astype(np.uint8) * 255
 
+    # Pass 2: aggressive close on the isolated sheet only, to swallow seed
+    # piles that cover the centre of the sheet.
     field = cv2.morphologyEx(sheet_only, cv2.MORPH_CLOSE, close_final_kernel, iterations=2)
-    field = _fill_holes(field)
+    field = fill_holes(field)
 
     n, labels, stats, _ = cv2.connectedComponentsWithStats(field, connectivity=8)
     comp_small = np.zeros_like(field)
@@ -666,6 +524,10 @@ def _cyan_field_mask(img_work: np.ndarray) -> tuple[np.ndarray, dict]:
             idx = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
             comp_small = (labels == idx).astype(np.uint8) * 255
 
+    # Seeds occupy a large share of the cyan field, so the connected
+    # component above only covers the *visible* cyan pixels (the ring
+    # around the seed pile). Replace it with its convex hull so the entire
+    # cyan rectangle, including the seed-covered interior, is captured.
     if comp_small.any():
         contours, _ = cv2.findContours(comp_small, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
@@ -683,7 +545,19 @@ def _cyan_field_mask(img_work: np.ndarray) -> tuple[np.ndarray, dict]:
 
 
 def _table_mask(img_work: np.ndarray) -> tuple[np.ndarray, dict]:
+    """Detect the wooden table region around the paper sheet.
+
+    Pre-processing: bilateral filter on a slightly downscaled copy smooths
+    out wood grain and seed texture so a single LAB cluster captures the
+    table cleanly, then we upsample the result.
+
+    Strategy: sample a thin border ring on every side, take the *darkest
+    quartile* of each side independently, and combine these into a global
+    "table colour" estimate. This works whether the table fills the ring
+    (most photos) or only a thin sliver of one side (paper-fills-frame).
+    """
     h, w = img_work.shape[:2]
+    # Pre-process: downscale + bilateral. Faster and more robust to noise.
     pp_short = 600
     short = min(h, w)
     pp_scale = 1.0 if short <= pp_short else pp_short / float(short)
@@ -732,6 +606,8 @@ def _table_mask(img_work: np.ndarray) -> tuple[np.ndarray, dict]:
     if not L_dark_parts:
         return np.ones((h, w), dtype=np.uint8) * 255, info
 
+    # Filter: only sides whose dark median is plausibly table (L<140) feed
+    # the global table-colour estimate. This avoids using a paper-only side.
     table_sides = [(Ls, as_, bs_) for (Ls, as_, bs_), m in zip(zip(L_dark_parts, a_dark_parts, b_dark_parts), side_meds) if m < 140.0]
     if not table_sides:
         info["table_present"] = False
@@ -754,6 +630,8 @@ def _table_mask(img_work: np.ndarray) -> tuple[np.ndarray, dict]:
         "ring_L_mad": round(L_mad, 2),
     })
 
+    # Mahalanobis-like distance with per-axis MAD scaling. Wood has tight
+    # spread; paper is far in at least one axis.
     dL = (L - L_med) / max(L_mad, 3.0)
     da = (a - a_med) / max(a_mad, 2.0)
     db = (b - b_med) / max(b_mad, 2.0)
@@ -761,15 +639,16 @@ def _table_mask(img_work: np.ndarray) -> tuple[np.ndarray, dict]:
     L_cutoff = L_med + max(20.0, 8.0 * L_mad)
     table = (d_ring < 5.0) & (L < L_cutoff)
 
+    # Paper = NOT table.
     paper_raw = (~table).astype(np.uint8) * 255
     diag_s = float(np.hypot(sh, sw))
-    open_k = _odd(diag_s * 0.005, 5)
-    close_k = _odd(diag_s * 0.014, 11)
+    open_k = odd(diag_s * 0.005, 5)
+    close_k = odd(diag_s * 0.014, 11)
     open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k, open_k))
     close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
     paper = cv2.morphologyEx(paper_raw, cv2.MORPH_OPEN, open_kernel, iterations=1)
     paper = cv2.morphologyEx(paper, cv2.MORPH_CLOSE, close_kernel, iterations=2)
-    paper = _fill_holes(paper)
+    paper = fill_holes(paper)
 
     n, labels, stats, _ = cv2.connectedComponentsWithStats(paper, connectivity=8)
     comp_small = np.zeros_like(paper)
@@ -782,6 +661,7 @@ def _table_mask(img_work: np.ndarray) -> tuple[np.ndarray, dict]:
             idx = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
             comp_small = (labels == idx).astype(np.uint8) * 255
 
+    # Upsample back to img_work resolution.
     if pp_scale < 1.0:
         comp = cv2.resize(comp_small, (w, h), interpolation=cv2.INTER_NEAREST)
         comp = ((comp > 0).astype(np.uint8)) * 255
@@ -790,13 +670,15 @@ def _table_mask(img_work: np.ndarray) -> tuple[np.ndarray, dict]:
     return comp, info
 
 
-def _detect_paper_mask(img_bgr: np.ndarray) -> tuple[np.ndarray, dict]:
-    """Detect the paper sheet and return its filled mask + 4 corners (quad).
+def detect_paper_mask(img_bgr: np.ndarray) -> tuple[np.ndarray, dict]:
+    """Detect the paper sheet (beige + any inner coloured field) and return
+    its 4 corners + filled mask.
 
-    Ported from AlgorithmVersions/VersionWithoutScan2/run_pipeline_v3.py.
-    Contract: returned info ALWAYS contains key "quad" (fallback included).
+    The goal is to exclude the wooden table from downstream seed
+    segmentation. Paper may contain multiple colour zones (beige rim, cyan
+    interior); we don't try to separate them -- we segment the *table* and
+    take its complement, so the entire sheet ends up inside the ROI.
     """
-
     orig_h, orig_w = img_bgr.shape[:2]
     work_short = 900
     short = min(orig_h, orig_w)
@@ -812,34 +694,43 @@ def _detect_paper_mask(img_bgr: np.ndarray) -> tuple[np.ndarray, dict]:
     h, w = img_work.shape[:2]
     diag = float(np.hypot(h, w))
 
+    # Primary: segment the cyan/blue field directly. The seed paper is a
+    # consistent light-cyan (Lab a<0, b<0, L>140); the wooden table is dark
+    # warm, the beige backing paper is bright but warm (b>0). A direct LAB
+    # filter for "bright + cool" isolates the cyan sheet cleanly even when
+    # a beige backing surrounds it.
     cyan_comp, cyan_info = _cyan_field_mask(img_work)
     if int(cyan_comp.sum()) >= 0.10 * h * w * 255:
         best_comp = cyan_comp
         table_info = {"strategy": "cyan_field", **cyan_info}
     else:
+        # Fallback: subtract the wooden table -- works on already-cropped
+        # photos where the entire frame is already the cyan sheet.
         best_comp, tinfo = _table_mask(img_work)
         table_info = {"strategy": "table_subtract", **tinfo}
-
     if int(best_comp.sum()) < 0.10 * h * w * 255:
+        # Could not isolate paper from table -- give up and use full frame.
         mask = np.ones((orig_h, orig_w), dtype=np.uint8) * 255
         quad = np.array([[0, 0], [orig_w - 1, 0], [orig_w - 1, orig_h - 1], [0, orig_h - 1]], dtype=np.float32)
         info = {"fallback": "full_frame", "quad": quad.tolist(), **table_info}
         return mask, info
-
     best_score, best_info = _score_paper_component(best_comp, h, w)
     best_info.update(table_info)
+    close_k = odd(diag * 0.012, 11)
 
+    # Find the paper contour and reduce it to 4 corners.
     contours, _ = cv2.findContours(best_comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     quad_work: np.ndarray | None = None
     quad_source = "none"
-
+    # Preferred: fit 4 lines to the boundary -- robust to small bridges
+    # between the paper component and the wood table.
     quad_work, edge_status = _quad_from_paper_edges(best_comp)
     if quad_work is not None:
         quad_source = edge_status
-
     if contours and quad_work is None:
         contour = max(contours, key=cv2.contourArea)
         contour_area = float(cv2.contourArea(contour))
+        # Fallback 1: polyDP 4-gon.
         quad_work = _quad_from_contour(contour)
         if quad_work is not None:
             quad_area = float(cv2.contourArea(quad_work.astype(np.float32)))
@@ -854,7 +745,8 @@ def _detect_paper_mask(img_bgr: np.ndarray) -> tuple[np.ndarray, dict]:
             quad_source = f"minAreaRect({edge_status})"
 
     if quad_work is None:
-        x, y, bw, bh = _component_bbox(best_comp)
+        # Last-resort: use bbox.
+        x, y, bw, bh = component_bbox(best_comp)
         quad_work = np.array(
             [[x, y], [x + bw - 1, y], [x + bw - 1, y + bh - 1], [x, y + bh - 1]],
             dtype=np.float32,
@@ -864,6 +756,9 @@ def _detect_paper_mask(img_bgr: np.ndarray) -> tuple[np.ndarray, dict]:
     quad_work = _order_quad(quad_work)
     quad_work, border_info = _refine_quad_by_border_color(img_work, quad_work)
 
+    # Inward shrink along corner-vectors (keeps the warp safely inside the
+    # paper, away from the wood edge and any glow/shadow band along it).
+    # Kept small so seeds resting on the very edge of the sheet stay inside.
     cx, cy = quad_work.mean(axis=0)
     shrink = max(4.0, diag * 0.008)
     centered = quad_work - np.array([cx, cy])
@@ -871,9 +766,11 @@ def _detect_paper_mask(img_bgr: np.ndarray) -> tuple[np.ndarray, dict]:
     norms[norms < 1e-6] = 1.0
     quad_shrunk = quad_work - centered / norms * shrink
 
+    # Build a clean polygon mask at work resolution from the shrunk quad.
     quad_mask_work = np.zeros((h, w), dtype=np.uint8)
     cv2.fillPoly(quad_mask_work, [quad_shrunk.astype(np.int32)], 255)
 
+    # Scale the quad and mask back to original image coordinates.
     if scale < 1.0:
         quad_orig = quad_shrunk / scale
         paper_mask = cv2.resize(quad_mask_work, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
@@ -883,10 +780,12 @@ def _detect_paper_mask(img_bgr: np.ndarray) -> tuple[np.ndarray, dict]:
         paper_mask = quad_mask_work
 
     quad_orig = quad_orig.astype(np.float32)
-    x, y, bw, bh = _component_bbox(paper_mask)
+
+    x, y, bw, bh = component_bbox(paper_mask)
     best_info.update({
         "area_frac": round(float((paper_mask > 0).sum()) / float(orig_h * orig_w), 4),
         "bbox": [x, y, bw, bh],
+        "close_k": close_k,
         "work_scale": round(scale, 4),
         "score": round(float(best_score), 4),
         "quad_source": quad_source,
@@ -896,9 +795,26 @@ def _detect_paper_mask(img_bgr: np.ndarray) -> tuple[np.ndarray, dict]:
     return paper_mask, best_info
 
 
-def _warp_to_paper(img_bgr: np.ndarray, paper_mask: np.ndarray, quad: np.ndarray) -> tuple[np.ndarray, np.ndarray, dict]:
-    """Perspective-warp the paper quad to an axis-aligned rectangle (v3)."""
+def draw_paper_detect(img_bgr: np.ndarray, paper_mask: np.ndarray, quad: np.ndarray) -> np.ndarray:
+    vis = img_bgr.copy()
+    overlay = vis.copy()
+    overlay[paper_mask > 0] = (255, 180, 0)
+    cv2.addWeighted(overlay, 0.25, vis, 0.75, 0, vis)
+    poly = quad.astype(np.int32).reshape(-1, 1, 2)
+    cv2.polylines(vis, [poly], isClosed=True, color=(0, 0, 255), thickness=3)
+    for i, p in enumerate(quad.astype(int)):
+        cv2.circle(vis, tuple(p), 10, (0, 255, 255), -1)
+        cv2.putText(vis, "TL TR BR BL".split()[i], tuple(p + np.array([10, -10])),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
+    return vis
 
+
+def warp_to_paper(img_bgr: np.ndarray, paper_mask: np.ndarray, quad: np.ndarray) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Perspective-warp the paper quad to an axis-aligned rectangle.
+
+    The output image contains only the paper interior, so wood corners cannot
+    leak into the seed segmentation.
+    """
     quad = _order_quad(np.asarray(quad, dtype=np.float32))
     tl, tr, br, bl = quad
     width_a = float(np.linalg.norm(br - bl))
@@ -920,12 +836,7 @@ def _warp_to_paper(img_bgr: np.ndarray, paper_mask: np.ndarray, quad: np.ndarray
     return warped, warped_mask, info
 
 
-def _crop_to_paper(img_bgr: np.ndarray, paper_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int, int]]:
-    x, y, w, h = _component_bbox(paper_mask)
-    return img_bgr[y:y + h, x:x + w].copy(), paper_mask[y:y + h, x:x + w].copy(), (x, y, w, h)
-
-
-def _resize_short(img: np.ndarray, target_short: int, interpolation: int) -> np.ndarray:
+def resize_short(img: np.ndarray, target_short: int, interpolation: int) -> np.ndarray:
     h, w = img.shape[:2]
     short = min(h, w)
     if short >= target_short:
@@ -934,7 +845,7 @@ def _resize_short(img: np.ndarray, target_short: int, interpolation: int) -> np.
     return cv2.resize(img, (int(round(w * scale)), int(round(h * scale))), interpolation=interpolation)
 
 
-def _estimate_paper_color(img_bgr: np.ndarray, paper_mask: np.ndarray | None = None) -> np.ndarray:
+def estimate_paper_color(img_bgr: np.ndarray, paper_mask: np.ndarray | None = None) -> np.ndarray:
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     sat = hsv[:, :, 1]
@@ -951,7 +862,7 @@ def _estimate_paper_color(img_bgr: np.ndarray, paper_mask: np.ndarray | None = N
     return np.median(img_bgr[cand].reshape(-1, 3).astype(np.float32), axis=0)
 
 
-def _paper_pixel_mask(img_bgr: np.ndarray, paper_mask: np.ndarray, paper_bgr: np.ndarray) -> np.ndarray:
+def paper_pixel_mask(img_bgr: np.ndarray, paper_mask: np.ndarray, paper_bgr: np.ndarray) -> np.ndarray:
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     paper_lab = cv2.cvtColor(paper_bgr.reshape(1, 1, 3).astype(np.uint8), cv2.COLOR_BGR2LAB)
     paper_lab = paper_lab.astype(np.float32).reshape(3)
@@ -967,14 +878,14 @@ def _paper_pixel_mask(img_bgr: np.ndarray, paper_mask: np.ndarray, paper_bgr: np
     min_gray = max(100, int(np.percentile(gray_valid, 35)))
     mask = valid & (d_e < 22.0) & (sat < 80) & (val > min_gray)
     out = mask.astype(np.uint8) * 255
-    k = _odd(min(img_bgr.shape[:2]) / 180.0, 3)
+    k = odd(min(img_bgr.shape[:2]) / 180.0, 3)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     out = cv2.morphologyEx(out, cv2.MORPH_OPEN, kernel, iterations=1)
     out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, kernel, iterations=1)
     return out
 
 
-def _fit_poly_flatfield(channel: np.ndarray, mask_u8: np.ndarray, degree: int = 3) -> np.ndarray:
+def fit_poly_flatfield(channel: np.ndarray, mask_u8: np.ndarray, degree: int = 3) -> np.ndarray:
     h, w = channel.shape
     ys, xs = np.where(mask_u8 > 0)
     if len(xs) < 500:
@@ -1000,7 +911,7 @@ def _fit_poly_flatfield(channel: np.ndarray, mask_u8: np.ndarray, degree: int = 
     return surf.astype(np.float32)
 
 
-def _estimate_background(img_bgr: np.ndarray, paper_mask: np.ndarray, work_short: int = 900) -> np.ndarray:
+def estimate_background(img_bgr: np.ndarray, paper_mask: np.ndarray, work_short: int = 900) -> np.ndarray:
     h, w = img_bgr.shape[:2]
     short = min(h, w)
     scale = 1.0 if short <= work_short else work_short / float(short)
@@ -1011,23 +922,23 @@ def _estimate_background(img_bgr: np.ndarray, paper_mask: np.ndarray, work_short
         small = img_bgr
         small_mask = paper_mask
 
-    paper_bgr = _estimate_paper_color(small, small_mask)
-    clean_paper = _paper_pixel_mask(small, small_mask, paper_bgr)
+    paper_bgr = estimate_paper_color(small, small_mask)
+    clean_paper = paper_pixel_mask(small, small_mask, paper_bgr)
     paper_area = max(1, int((small_mask > 0).sum()))
     coverage = float((clean_paper > 0).sum()) / paper_area
 
     if coverage < 0.025:
         filled = small.copy()
         filled[small_mask == 0] = paper_bgr.astype(np.uint8)
-        k = _odd(min(small.shape[:2]) / 6.0, 31)
+        k = odd(min(small.shape[:2]) / 6.0, 31)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
         bg_small = cv2.dilate(filled, kernel)
-        bg_small = cv2.medianBlur(bg_small, min(31, _odd(k / 2.0, 3)))
+        bg_small = cv2.medianBlur(bg_small, min(31, odd(k / 2.0, 3)))
         bg_small = cv2.GaussianBlur(bg_small, (0, 0), sigmaX=k * 0.55, sigmaY=k * 0.55)
     else:
         bg_small = np.zeros_like(small, dtype=np.float32)
         for channel in range(3):
-            bg_small[:, :, channel] = _fit_poly_flatfield(small[:, :, channel], clean_paper, degree=3)
+            bg_small[:, :, channel] = fit_poly_flatfield(small[:, :, channel], clean_paper, degree=3)
         sigma = max(5.0, min(small.shape[:2]) * 0.02)
         bg_small = cv2.GaussianBlur(bg_small, (0, 0), sigmaX=sigma, sigmaY=sigma)
         paper_ref = small[clean_paper > 0].reshape(-1, 3).astype(np.float32)
@@ -1042,7 +953,7 @@ def _estimate_background(img_bgr: np.ndarray, paper_mask: np.ndarray, work_short
     return np.maximum(bg.astype(np.float32), 1.0)
 
 
-def _paper_wb_and_levels(img_bgr: np.ndarray, paper_mask: np.ndarray, target: float = 240.0) -> np.ndarray:
+def paper_wb_and_levels(img_bgr: np.ndarray, paper_mask: np.ndarray, target: float = 240.0) -> np.ndarray:
     out = img_bgr.astype(np.float32)
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     valid = paper_mask > 0
@@ -1059,17 +970,17 @@ def _paper_wb_and_levels(img_bgr: np.ndarray, paper_mask: np.ndarray, target: fl
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def _normalize_scan(img_bgr: np.ndarray, paper_mask: np.ndarray, do_shading: bool = True) -> np.ndarray:
+def normalize_scan(img_bgr: np.ndarray, paper_mask: np.ndarray, do_shading: bool = True) -> np.ndarray:
     src = cv2.bilateralFilter(img_bgr, d=5, sigmaColor=25, sigmaSpace=7)
     if do_shading:
-        bg = _estimate_background(src, paper_mask)
+        bg = estimate_background(src, paper_mask)
         out = np.clip(src.astype(np.float32) / bg * 240.0, 0, 255).astype(np.uint8)
     else:
         out = src
-    return _paper_wb_and_levels(out, paper_mask, target=240.0)
+    return paper_wb_and_levels(out, paper_mask, target=240.0)
 
 
-def _compute_delta_e(img_bgr: np.ndarray, paper_mask: np.ndarray | None = None) -> tuple[np.ndarray, tuple[float, float, float]]:
+def compute_delta_e(img_bgr: np.ndarray, paper_mask: np.ndarray | None = None) -> tuple[np.ndarray, tuple[float, float, float]]:
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     light = lab[:, :, 0]
     a = lab[:, :, 1] - 128.0
@@ -1091,27 +1002,27 @@ def _compute_delta_e(img_bgr: np.ndarray, paper_mask: np.ndarray | None = None) 
     return d_e.astype(np.float32), (p_l, p_a, p_b)
 
 
-def _white_balance_to_paper(img_bgr: np.ndarray, paper_mask: np.ndarray) -> np.ndarray:
-    paper_bgr = np.maximum(_estimate_paper_color(img_bgr, paper_mask), 1.0)
+def white_balance_to_paper(img_bgr: np.ndarray, paper_mask: np.ndarray) -> np.ndarray:
+    paper_bgr = np.maximum(estimate_paper_color(img_bgr, paper_mask), 1.0)
     gains = np.clip(255.0 / paper_bgr, 0.92, 1.18)
     out = img_bgr.astype(np.float32) * gains[None, None, :]
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def _segment_all_seeds_v2(img_bgr: np.ndarray, paper_mask: np.ndarray) -> tuple[np.ndarray, list, dict]:
+def segment_all_seeds(img_bgr: np.ndarray, paper_mask: np.ndarray, return_debug: bool = False):
     h, w = img_bgr.shape[:2]
     diag = float(np.hypot(h, w))
     short = min(h, w)
-    k3 = _odd(diag / 1200.0, 3)
-    k7 = _odd(diag / 500.0, 7)
+    k3 = odd(diag / 1200.0, 3)
+    k7 = odd(diag / 500.0, 7)
 
-    d_e, paper_lab = _compute_delta_e(img_bgr, paper_mask)
-    k_bg = _odd(short / 12.0, 31)
+    d_e, paper_lab = compute_delta_e(img_bgr, paper_mask)
+    k_bg = odd(short / 12.0, 31)
     d_e_u8 = np.clip(d_e, 0, 255).astype(np.uint8)
     scale = min(1.0, 800.0 / short) if short > 800 else 1.0
     if scale < 1.0:
         small = cv2.resize(d_e_u8, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-        k_bg_s = _odd(k_bg * scale, 9)
+        k_bg_s = odd(k_bg * scale, 9)
         kernel_s = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_bg_s, k_bg_s))
         bg_small = cv2.morphologyEx(small, cv2.MORPH_OPEN, kernel_s)
         bg = cv2.resize(bg_small, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -1122,17 +1033,12 @@ def _segment_all_seeds_v2(img_bgr: np.ndarray, paper_mask: np.ndarray) -> tuple[
 
     vals = d_e_local[(d_e_local > 1.0) & (paper_mask > 0)]
     if vals.size > 1000:
-        thr_otsu, _ = cv2.threshold(
-            np.clip(vals, 0, 255).astype(np.uint8),
-            0,
-            255,
-            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-        )
+        thr_otsu, _ = cv2.threshold(np.clip(vals, 0, 255).astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         thr = float(max(3.0, min(15.0, thr_otsu)))
     else:
         thr = 5.0
 
-    edge_k = _odd(diag * 0.0012, 3)
+    edge_k = odd(diag * 0.0012, 3)
     edge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (edge_k, edge_k))
     allowed = cv2.erode(paper_mask, edge_kernel, iterations=1)
     fg = ((d_e_local > thr) & (allowed > 0)).astype(np.uint8) * 255
@@ -1167,7 +1073,7 @@ def _segment_all_seeds_v2(img_bgr: np.ndarray, paper_mask: np.ndarray) -> tuple[
         result[comp] = 255
 
     dark_u8 = dark_pix.astype(np.uint8) * 255
-    k_small = _odd(k3 / 2.0, 3)
+    k_small = odd(k3 / 2.0, 3)
     kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_small, k_small))
     dark_closed = cv2.morphologyEx(dark_u8, cv2.MORPH_CLOSE, kernel_small, iterations=1)
     dark_dilated = cv2.dilate(dark_closed, kernel_small, iterations=1)
@@ -1179,11 +1085,18 @@ def _segment_all_seeds_v2(img_bgr: np.ndarray, paper_mask: np.ndarray) -> tuple[
         "seed_count": len(contours),
         "all_seed_area_px": int((result > 0).sum()),
         "image_area_px": h * w,
+        "deltaE_thresh_used": round(float(thr), 2),
+        "paper_L": round(float(paper_lab[0]), 1),
+        "paper_a": round(float(paper_lab[1]), 2),
+        "paper_b": round(float(paper_lab[2]), 2),
+        "method": "v2_paper_masked_tophat",
     }
+    if return_debug:
+        stats_out["_debug"] = {"dE": d_e, "dE_local": d_e_local}
     return result, contours, stats_out
 
 
-def _segment_black_seeds_v2(img_bgr: np.ndarray, all_mask: np.ndarray, paper_mask: np.ndarray) -> tuple[np.ndarray, list, dict]:
+def segment_black_seeds(img_bgr: np.ndarray, all_mask: np.ndarray, paper_mask: np.ndarray):
     h, w = img_bgr.shape[:2]
     diag = float(np.hypot(h, w))
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
@@ -1199,8 +1112,8 @@ def _segment_black_seeds_v2(img_bgr: np.ndarray, all_mask: np.ndarray, paper_mas
             l_core = float(np.clip(np.percentile(dark, 90) + 5.0, 65.0, 85.0))
             l_semi = float(np.clip(l_core + 20.0, 85.0, 105.0))
 
-    k3 = _odd(diag / 1200.0, 3)
-    k5 = _odd(diag / 700.0, 5)
+    k3 = odd(diag / 1200.0, 3)
+    k5 = odd(diag / 700.0, 5)
     kernel_core = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k5, k5))
     kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k3, k3))
     core = ((light < l_core) & valid).astype(np.uint8) * 255
@@ -1264,18 +1177,20 @@ def _segment_black_seeds_v2(img_bgr: np.ndarray, all_mask: np.ndarray, paper_mas
     stats_out = {
         "black_seed_count": len(contours),
         "black_seed_area_px": int((result > 0).sum()),
+        "L_core_used": round(float(l_core), 1),
+        "L_semi_used": round(float(l_semi), 1),
     }
     return result, contours, stats_out
 
 
-def _recover_black_pixels(img_bgr: np.ndarray, all_mask: np.ndarray, paper_mask: np.ndarray, light: np.ndarray | None = None) -> np.ndarray:
+def recover_black_pixels(img_bgr: np.ndarray, all_mask: np.ndarray, paper_mask: np.ndarray, light: np.ndarray | None = None) -> np.ndarray:
     if light is None:
         light = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
     h, w = all_mask.shape
     diag = float(np.hypot(h, w))
     valid = (all_mask > 0) & (paper_mask > 0)
     hard = ((light < 55.0) & valid).astype(np.uint8) * 255
-    k3 = _odd(diag / 1200.0, 3)
+    k3 = odd(diag / 1200.0, 3)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k3, k3))
     hard = cv2.morphologyEx(hard, cv2.MORPH_OPEN, kernel, iterations=1)
     hard = cv2.morphologyEx(hard, cv2.MORPH_CLOSE, kernel, iterations=1)
@@ -1287,17 +1202,24 @@ def _recover_black_pixels(img_bgr: np.ndarray, all_mask: np.ndarray, paper_mask:
         area = int(stats[label, cv2.CC_STAT_AREA])
         if area < min_area:
             continue
-        comp = labels == label
-        l_in = light[comp]
-        mean_l = float(l_in.mean())
-        std_l = float(l_in.std())
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
         bw = int(stats[label, cv2.CC_STAT_WIDTH])
         bh = int(stats[label, cv2.CC_STAT_HEIGHT])
+        yy = slice(y, y + bh)
+        xx = slice(x, x + bw)
+        comp = labels[yy, xx] == label
+        l_in = light[yy, xx][comp]
+        med_l = float(np.median(l_in))
+        mean_l = float(l_in.mean())
+        std_l = float(l_in.std())
         fill = area / float(max(1, bw * bh))
         aspect = min(bw, bh) / float(max(1, max(bw, bh)))
         if mean_l > 67.0:
             continue
         if std_l < 6.0:
+            continue
+        if fill < 0.18 or aspect < 0.06:
             continue
         if fill < 0.30:
             continue
@@ -1316,11 +1238,12 @@ def _recover_black_pixels(img_bgr: np.ndarray, all_mask: np.ndarray, paper_mask:
         hard_frac = float((l_in < 55.0).sum()) / float(area)
         if hard_frac < 0.25:
             continue
-        out[comp] = 255
+        out_roi = out[yy, xx]
+        out_roi[comp] = 255
     return out
 
 
-def _interior_holes(mask_u8: np.ndarray) -> np.ndarray:
+def interior_holes(mask_u8: np.ndarray) -> np.ndarray:
     h, w = mask_u8.shape
     inv = cv2.bitwise_not(mask_u8)
     pad = cv2.copyMakeBorder(inv, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=255)
@@ -1329,45 +1252,71 @@ def _interior_holes(mask_u8: np.ndarray) -> np.ndarray:
     return pad[1:-1, 1:-1]
 
 
-def _fixup_masks(img_bgr: np.ndarray, paper_mask: np.ndarray, all_mask: np.ndarray, black_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def fixup_masks(img_bgr: np.ndarray, paper_mask: np.ndarray, all_mask: np.ndarray, black_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, dict]:
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     light = lab[:, :, 0]
     chroma = np.hypot(lab[:, :, 1] - 128.0, lab[:, :, 2] - 128.0)
-    paper_pix = (paper_mask > 0) & (all_mask == 0) & (light > 190) & (chroma < 15)
-    paper_l = float(np.median(light[paper_pix])) if int(paper_pix.sum()) > 1000 else 240.0
+    paper_bool = paper_mask > 0
+    paper_pix = paper_bool & (all_mask == 0) & (light > 190) & (chroma < 15)
+    paper_l = float(np.median(light[paper_pix])) if int(np.count_nonzero(paper_pix)) > 1000 else 240.0
 
-    holes = _interior_holes(all_mask)
+    holes = interior_holes(all_mask)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(holes, connectivity=8)
     accepted = np.zeros_like(holes)
     for label in range(1, n):
-        comp = labels == label
         area = int(stats[label, cv2.CC_STAT_AREA])
         if area < 4:
             continue
-        if int(((paper_mask > 0) & comp).sum()) < area * 0.95:
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        bw = int(stats[label, cv2.CC_STAT_WIDTH])
+        bh = int(stats[label, cv2.CC_STAT_HEIGHT])
+        yy = slice(y, y + bh)
+        xx = slice(x, x + bw)
+        comp = labels[yy, xx] == label
+        if int(np.count_nonzero(paper_bool[yy, xx] & comp)) < area * 0.95:
             continue
-        med_l = float(np.median(light[comp]))
-        mean_chroma = float(chroma[comp].mean())
+        med_l = float(np.median(light[yy, xx][comp]))
+        mean_chroma = float(chroma[yy, xx][comp].mean())
         if mean_chroma >= 45.0:
             continue
+        accept = False
         if area < 200 and med_l < paper_l - 20.0:
-            accepted[comp] = 255
+            accept = True
         elif area < 2500 and med_l < paper_l - 45.0:
-            accepted[comp] = 255
+            accept = True
         elif med_l < paper_l - 80.0:
-            accepted[comp] = 255
-
+            accept = True
+        if accept:
+            accepted_roi = accepted[yy, xx]
+            accepted_roi[comp] = 255
     fixed_all = cv2.bitwise_or(all_mask, accepted)
     fixed_all = cv2.bitwise_and(fixed_all, paper_mask)
 
-    recovered = _recover_black_pixels(img_bgr, fixed_all, paper_mask, light)
+    recovered = recover_black_pixels(img_bgr, fixed_all, paper_mask, light)
     fixed_black = cv2.bitwise_or(black_mask, recovered)
     fixed_black = cv2.bitwise_and(fixed_black, fixed_all)
     fixed_black = cv2.bitwise_and(fixed_black, paper_mask)
-    return fixed_all, fixed_black
+    info = {
+        "paper_L": round(paper_l, 1),
+        "all_added_px": int(cv2.countNonZero(fixed_all) - cv2.countNonZero(all_mask)),
+        "black_added_px": int(cv2.countNonZero(fixed_black) - cv2.countNonZero(black_mask)),
+    }
+    return fixed_all, fixed_black, info
 
 
-def _overlay_mask(img_bgr: np.ndarray, mask_u8: np.ndarray, color: tuple[int, int, int], alpha: float) -> np.ndarray:
+def put_text_block(vis: np.ndarray, lines: list[str], origin: tuple[int, int] = (12, 30)) -> None:
+    scale = max(0.55, min(vis.shape[:2]) / 1800.0)
+    thickness = max(1, int(round(scale * 2)))
+    y = origin[1]
+    for line in lines:
+        (tw, th), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+        cv2.rectangle(vis, (origin[0] - 4, y - th - 5), (origin[0] + tw + 4, y + 5), (0, 0, 0), cv2.FILLED)
+        cv2.putText(vis, line, (origin[0], y), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        y += th + 12
+
+
+def overlay_mask(img_bgr: np.ndarray, mask_u8: np.ndarray, color: tuple[int, int, int], alpha: float) -> np.ndarray:
     vis = img_bgr.copy()
     overlay = vis.copy()
     overlay[mask_u8 > 0] = color
@@ -1375,466 +1324,343 @@ def _overlay_mask(img_bgr: np.ndarray, mask_u8: np.ndarray, color: tuple[int, in
     return vis
 
 
-def _visualize_all_v2(img_bgr: np.ndarray, all_mask: np.ndarray, seed_count: int, all_area_px: int) -> np.ndarray:
-    vis = _overlay_mask(img_bgr, all_mask, (0, 210, 0), 0.35)
+def visualize_all(img_bgr: np.ndarray, all_mask: np.ndarray, stats: dict) -> np.ndarray:
+    vis = overlay_mask(img_bgr, all_mask, (0, 210, 0), 0.35)
     contours, _ = cv2.findContours(all_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(vis, contours, -1, (0, 255, 0), 1)
-    _put_text_block(vis, [f"All seeds: {seed_count}", f"Area: {all_area_px} px"], origin=(12, 30), font_scale=0.7, thickness=2)
+    put_text_block(vis, [
+        f"All seeds: {stats['seed_count']}",
+        f"Area: {stats['all_seed_area_px']}",
+        f"dE thr: {stats['deltaE_thresh_used']}",
+    ])
     return vis
 
 
-def _visualize_black_v2(img_bgr: np.ndarray, black_mask: np.ndarray, black_count: int, black_area_px: int) -> np.ndarray:
-    vis = _overlay_mask(img_bgr, black_mask, (0, 0, 230), 0.42)
+def visualize_black(img_bgr: np.ndarray, black_mask: np.ndarray, stats: dict) -> np.ndarray:
+    vis = overlay_mask(img_bgr, black_mask, (0, 0, 230), 0.42)
     contours, _ = cv2.findContours(black_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(vis, contours, -1, (0, 0, 255), 1)
-    _put_text_block(vis, [f"Black seeds: {black_count}", f"Area: {black_area_px} px"], origin=(12, 30), font_scale=0.7, thickness=2)
-    return vis
-
-
-def _visualize_black_release(img_bgr: np.ndarray, black_contours: list) -> np.ndarray:
-    """Create release overlay: only subtle red crosses per black seed contour.
-
-    This visualization intentionally avoids mask pixelation, contour drawing, and any text,
-    leaving only small fixed-size markers centered on each detected black seed.
-    """
-    vis = img_bgr.copy()
-    h, w = vis.shape[:2]
-
-    # Small, weakly image-size-dependent marker.
-    marker_size = max(8, int(round(min(h, w) * 0.008)))
-    marker_size = min(marker_size, 18)
-    thickness = 1
-    color = (0, 0, 255)  # BGR red
-
-    marker_type = getattr(cv2, "MARKER_TILTED_CROSS", None)
-    if marker_type is None:
-        marker_type = getattr(cv2, "MARKER_CROSS", 0)
-
-    for cnt in black_contours or []:
-        try:
-            M = cv2.moments(cnt)
-        except Exception:
-            M = {"m00": 0}
-
-        if float(M.get("m00", 0.0)) > 0.0:
-            cx = int(round(float(M.get("m10", 0.0)) / float(M["m00"])))
-            cy = int(round(float(M.get("m01", 0.0)) / float(M["m00"])))
-        else:
-            x, y, bw, bh = cv2.boundingRect(cnt)
-            cx = int(x + bw / 2.0)
-            cy = int(y + bh / 2.0)
-
-        cx = max(0, min(w - 1, cx))
-        cy = max(0, min(h - 1, cy))
-
-        if hasattr(cv2, "drawMarker"):
-            try:
-                cv2.drawMarker(
-                    vis,
-                    (cx, cy),
-                    color,
-                    markerType=marker_type,
-                    markerSize=int(marker_size),
-                    thickness=int(thickness),
-                    line_type=cv2.LINE_AA,
-                )
-                continue
-            except Exception:
-                pass
-
-        # Fallback if drawMarker is unavailable.
-        half = max(3, int(round(marker_size / 2.0)))
-        cv2.line(vis, (cx - half, cy - half), (cx + half, cy + half), color, thickness, cv2.LINE_AA)
-        cv2.line(vis, (cx - half, cy + half), (cx + half, cy - half), color, thickness, cv2.LINE_AA)
-
-    return vis
-
-
-# ──────────────────────────────────────────────────────────────────────
-#  Visualization helpers
-# ──────────────────────────────────────────────────────────────────────
-
-def _put_text_block(vis, lines, origin=(12, 30), font_scale=0.7, thickness=2):
-    y = origin[1]
-    for line in lines:
-        (tw, th), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-        cv2.rectangle(vis, (origin[0] - 4, y - th - 4), (origin[0] + tw + 4, y + 4), (0, 0, 0), cv2.FILLED)
-        cv2.putText(vis, line, (origin[0], y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), thickness, cv2.LINE_AA)
-        y += th + 14
-
-
-def visualize_all_seeds(img, mask, contours, stats, path):
-    vis = img.copy()
-    overlay = img.copy()
-    overlay[mask > 0] = (0, 200, 0)
-    cv2.addWeighted(overlay, 0.35, vis, 0.65, 0, vis)
-    cv2.drawContours(vis, contours, -1, (0, 255, 0), 1)
-    _put_text_block(vis, [
-        f"All seeds: {stats['seed_count']}",
-        f"Area: {stats['all_seed_area_px']} px",
-    ])
-    if not _safe_cv2_write(Path(path), vis, ".jpg", quality=95):
-        raise OSError(f"Cannot write visualization file: {path}")
-
-
-def visualize_black_seeds(img, mask, contours, stats, path):
-    vis = img.copy()
-    overlay = img.copy()
-    overlay[mask > 0] = (0, 0, 220)
-    cv2.addWeighted(overlay, 0.40, vis, 0.60, 0, vis)
-    cv2.drawContours(vis, contours, -1, (0, 0, 255), 1)
-    for i, cnt in enumerate(contours):
-        M = cv2.moments(cnt)
-        if M["m00"] > 0:
-            cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
-            cv2.putText(vis, str(i + 1), (cx - 6, cy + 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 0), 1, cv2.LINE_AA)
-    _put_text_block(vis, [
+    put_text_block(vis, [
         f"Black seeds: {stats['black_seed_count']}",
-        f"Area: {stats['black_seed_area_px']} px",
+        f"Area: {stats['black_seed_area_px']}",
+        f"L core/semi: {stats['L_core_used']}/{stats['L_semi_used']}",
     ])
-    if not _safe_cv2_write(Path(path), vis, ".jpg", quality=95):
-        raise OSError(f"Cannot write visualization file: {path}")
+    return vis
 
 
-def _safe_cv2_read(path: Path):
-    try:
-        buf = np.fromfile(str(path), dtype=np.uint8)
-        if buf.size > 0:
-            img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-            if img is not None:
-                return img
-    except Exception:
-        pass
+def audit_result(img_bgr: np.ndarray, paper_mask: np.ndarray, all_mask: np.ndarray, black_mask: np.ndarray) -> dict:
+    h, w = img_bgr.shape[:2]
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    light = lab[:, :, 0]
+    chroma = np.hypot(lab[:, :, 1] - 128.0, lab[:, :, 2] - 128.0)
+    paper_pixels = (paper_mask > 0) & (all_mask == 0) & (light > 190) & (chroma < 15)
+    paper_l = float(np.median(light[paper_pixels])) if int(paper_pixels.sum()) > 1000 else 240.0
 
-    return cv2.imread(str(path), cv2.IMREAD_COLOR)
+    scope = paper_mask > 0
+    nonpaper = scope & (all_mask == 0) & (black_mask == 0) & ((light < 170) | (chroma > 15))
+    leak_blobs = connected_blob_summary(nonpaper, min_area=max(80, int(h * w * 1.0e-4)), light=light, chroma=chroma)
 
+    dark_outside = scope & (all_mask == 0) & (light < paper_l - 25.0) & (chroma < 30)
+    missed = connected_blob_summary(dark_outside, min_area=max(120, int(h * w * 4.0e-5)), light=light)
 
-def _safe_cv2_write(path: Path, image, ext: str, quality: int | None = None):
-    params = []
-    if quality is not None and ext.lower() in {".jpg", ".jpeg"}:
-        params = [cv2.IMWRITE_JPEG_QUALITY, quality]
+    very_dark = scope & (all_mask > 0) & (black_mask == 0) & (light < 65.0)
+    missed_black = connected_blob_summary(very_dark, min_area=200, light=light)
 
-    ok, encoded = cv2.imencode(ext, image, params)
-    if not ok:
-        return False
-    encoded.tofile(str(path))
-    return True
+    black_shadow_like = []
+    n_b, labels_b, stats_b, _ = cv2.connectedComponentsWithStats(black_mask, connectivity=8)
+    for label in range(1, n_b):
+        area = int(stats_b[label, cv2.CC_STAT_AREA])
+        if area < 50:
+            continue
+        comp = labels_b == label
+        l_in = light[comp]
+        med_l = float(np.median(l_in))
+        std_l = float(np.std(l_in))
+        flag = "ok"
+        if med_l > 95.0 and std_l < 8.0:
+            flag = "shadow_like"
+        elif med_l > 110.0:
+            flag = "too_bright"
+        if flag != "ok":
+            black_shadow_like.append({
+                "area": area,
+                "bbox": bbox_from_stats(stats_b, label),
+                "med_L": round(med_l, 1),
+                "std_L": round(std_l, 1),
+                "flag": flag,
+            })
+    black_shadow_like.sort(key=lambda item: -item["area"])
 
-
-def _resize_if_needed(img, max_pixels=DEFAULT_MAX_PIXELS, max_side=DEFAULT_MAX_SIDE):
-    h, w = img.shape[:2]
-    scale_px = math.sqrt(max_pixels / float(max(w * h, 1)))
-    scale_side = max_side / float(max(w, h))
-    scale = min(1.0, scale_px, scale_side)
-
-    if scale >= 1.0:
-        return img, {
-            "resized": False,
-            "scale": 1.0,
-            "processed_w": w,
-            "processed_h": h,
-        }
-
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
-    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    return resized, {
-        "resized": True,
-        "scale": float(scale),
-        "processed_w": new_w,
-        "processed_h": new_h,
-    }
-
-
-def _error_payload(code: str, message: str, details=None):
-    payload = {
-        "ok": False,
-        "error": {
-            "code": code,
-            "message": message,
-        },
-    }
-    if details:
-        payload["error"]["details"] = details
-    return payload
-
-
-def _safe_percent(numerator: int | float, denominator: int | float) -> float:
-    if denominator <= 0:
-        return 0.0
-    return float(numerator) * 100.0 / float(denominator)
-
-
-def analyze_image(
-    input_path,
-    output_dir,
-    max_pixels=DEFAULT_MAX_PIXELS,
-    max_side=DEFAULT_MAX_SIDE,
-    do_shading: bool = DEFAULT_DO_SHADING,
-    target_short: int = DEFAULT_TARGET_SHORT,
-    release_mode: bool = False,
-):
-    """Analyze one image and return a structured payload for UI/native bridges."""
-    started = time.perf_counter()
-
-    try:
-        input_path = Path(input_path).expanduser()
-        output_dir = Path(output_dir).expanduser()
-
-        if not input_path.exists():
-            return _error_payload("file_not_found", f"Input file not found: {input_path}")
-        if not input_path.is_file():
-            return _error_payload("invalid_input", f"Input path is not a file: {input_path}")
-        if input_path.suffix.lower() not in SUPPORTED_EXTS:
-            return _error_payload("unsupported_format", f"Unsupported file extension: {input_path.suffix}")
-
-        input_path = input_path.resolve()
-        output_dir = output_dir.resolve()
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        img = _safe_cv2_read(input_path)
-        if img is None:
-            return _error_payload("decode_error", "Cannot decode image (file may be corrupted)")
-
-        image_h, image_w = img.shape[:2]
-        prepared_img, prep = _resize_if_needed(img, max_pixels=max_pixels, max_side=max_side)
-        stem = input_path.stem
-
-        try:
-            # v3: detect paper(mask+quad) -> warp -> (optional upscale) -> normalize -> segment -> fixup
-            paper_full, detect_info = _detect_paper_mask(prepared_img)
-            ph, pw = prepared_img.shape[:2]
-            try:
-                quad = np.asarray(detect_info.get("quad"), dtype=np.float32).reshape(4, 2)
-            except Exception:
-                quad = np.array([[0, 0], [pw - 1, 0], [pw - 1, ph - 1], [0, ph - 1]], dtype=np.float32)
-
-            # Warp-to-paper is the primary ROI extraction in v3.
-            # Fallback to bbox-crop if warp fails or degenerates.
-            try:
-                crop_img, crop_paper, warp_info = _warp_to_paper(prepared_img, paper_full, quad)
-                out_w, out_h = (int(warp_info.get("out_size", [0, 0])[0]), int(warp_info.get("out_size", [0, 0])[1]))
-                if out_w < 80 or out_h < 80:
-                    raise ValueError(f"warp_out_too_small: {out_w}x{out_h}")
-            except Exception:
-                crop_img, crop_paper, _crop = _crop_to_paper(prepared_img, paper_full)
-
-            if target_short and int(target_short) > 0:
-                crop_img = _resize_short(crop_img, int(target_short), cv2.INTER_LANCZOS4)
-                crop_paper = _resize_short(crop_paper, int(target_short), cv2.INTER_NEAREST)
-                crop_paper = ((crop_paper > 0).astype(np.uint8)) * 255
-
-            normalized = _normalize_scan(crop_img, crop_paper, do_shading=bool(do_shading))
-            normalized = _white_balance_to_paper(normalized, crop_paper)
-
-            all_mask, _all_cnt, _all_stats = _segment_all_seeds_v2(normalized, crop_paper)
-            blk_mask, _blk_cnt, _blk_stats = _segment_black_seeds_v2(normalized, all_mask, crop_paper)
-            all_mask, blk_mask = _fixup_masks(normalized, crop_paper, all_mask, blk_mask)
-
-            # Refresh counts/contours after fixup.
-            all_cnt, _ = cv2.findContours(all_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            blk_cnt, _ = cv2.findContours(blk_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            all_stats = {
-                "seed_count": int(len(all_cnt)),
-                "all_seed_area_px": int((all_mask > 0).sum()),
-                "image_area_px": int(normalized.shape[0] * normalized.shape[1]),
-            }
-            blk_stats = {
-                "black_seed_count": int(len(blk_cnt)),
-                "black_seed_area_px": int((blk_mask > 0).sum()),
-            }
-        except cv2.error as exc:
-            return _error_payload("opencv_error", "OpenCV processing failed", str(exc))
-
-        all_seed_area_px = int(all_stats.get("all_seed_area_px", 0))
-        black_seed_area_px = int(blk_stats.get("black_seed_area_px", 0))
-        image_area_px = int(all_stats.get("image_area_px", 0))
-
-        all_seed_ratio_pct = _safe_percent(all_seed_area_px, image_area_px)
-        black_seed_ratio_pct = _safe_percent(black_seed_area_px, image_area_px)
-        black_to_all_seed_ratio_pct = _safe_percent(black_seed_area_px, all_seed_area_px)
-
-        all_mask_path = output_dir / f"{stem}_all_mask.png"
-        all_overlay_path = output_dir / f"{stem}_all_overlay.jpg"
-        black_mask_path = output_dir / f"{stem}_black_mask.png"
-        black_overlay_path = output_dir / f"{stem}_black_overlay.jpg"
-
-        if bool(release_mode):
-            try:
-                black_vis = _visualize_black_release(normalized, blk_cnt)
-                if not _safe_cv2_write(black_overlay_path, black_vis, ".jpg", quality=92):
-                    raise OSError(f"Cannot write visualization file: {black_overlay_path}")
-            except OSError as exc:
-                return _error_payload("write_error", "Cannot write black-seed overlay", str(exc))
-
-            processing_ms = int((time.perf_counter() - started) * 1000)
-            return {
-                "ok": True,
-                "image": str(input_path),
-                "image_w": int(image_w),
-                "image_h": int(image_h),
-                "processing_ms": processing_ms,
-                # Keep contract stable: only the existing metric keys are included.
-                "seed_count": int(all_stats.get("seed_count", 0)),
-                "all_seed_area_px": int(all_stats.get("all_seed_area_px", 0)),
-                "image_area_px": int(all_stats.get("image_area_px", 0)),
-                "black_seed_count": int(blk_stats.get("black_seed_count", 0)),
-                "black_seed_area_px": int(blk_stats.get("black_seed_area_px", 0)),
-                "all_seed_ratio_pct": all_seed_ratio_pct,
-                "black_seed_ratio_pct": black_seed_ratio_pct,
-                "black_to_all_seed_ratio_pct": black_to_all_seed_ratio_pct,
-                "preprocessing": prep,
-                "artifacts": {
-                    "black_overlay": str(black_overlay_path),
-                },
-            }
-
-        if not _safe_cv2_write(all_mask_path, all_mask, ".png"):
-            return _error_payload("write_error", f"Cannot write artifact: {all_mask_path}")
-        try:
-            all_vis = _visualize_all_v2(
-                normalized,
-                all_mask,
-                seed_count=int(all_stats["seed_count"]),
-                all_area_px=int(all_stats["all_seed_area_px"]),
-            )
-            if not _safe_cv2_write(all_overlay_path, all_vis, ".jpg", quality=92):
-                raise OSError(f"Cannot write visualization file: {all_overlay_path}")
-        except OSError as exc:
-            return _error_payload("write_error", "Cannot write all-seed overlay", str(exc))
-
-        if not _safe_cv2_write(black_mask_path, blk_mask, ".png"):
-            return _error_payload("write_error", f"Cannot write artifact: {black_mask_path}")
-        try:
-            black_vis = _visualize_black_v2(
-                normalized,
-                blk_mask,
-                black_count=int(blk_stats["black_seed_count"]),
-                black_area_px=int(blk_stats["black_seed_area_px"]),
-            )
-            if not _safe_cv2_write(black_overlay_path, black_vis, ".jpg", quality=92):
-                raise OSError(f"Cannot write visualization file: {black_overlay_path}")
-        except OSError as exc:
-            return _error_payload("write_error", "Cannot write black-seed overlay", str(exc))
-
-        processing_ms = int((time.perf_counter() - started) * 1000)
-        return {
-            "ok": True,
-            "image": str(input_path),
-            "image_w": int(image_w),
-            "image_h": int(image_h),
-            "processing_ms": processing_ms,
-            # Keep contract stable: only the existing metric keys are included.
-            "seed_count": int(all_stats.get("seed_count", 0)),
-            "all_seed_area_px": int(all_stats.get("all_seed_area_px", 0)),
-            "image_area_px": int(all_stats.get("image_area_px", 0)),
-            "black_seed_count": int(blk_stats.get("black_seed_count", 0)),
-            "black_seed_area_px": int(blk_stats.get("black_seed_area_px", 0)),
-            "all_seed_ratio_pct": all_seed_ratio_pct,
-            "black_seed_ratio_pct": black_seed_ratio_pct,
-            "black_to_all_seed_ratio_pct": black_to_all_seed_ratio_pct,
-            "preprocessing": prep,
-            "artifacts": {
-                "all_mask": str(all_mask_path),
-                "all_overlay": str(all_overlay_path),
-                "black_mask": str(black_mask_path),
-                "black_overlay": str(black_overlay_path),
-            },
-        }
-    except cv2.error as exc:
-        return _error_payload("opencv_error", "OpenCV processing failed", str(exc))
-    except Exception as exc:  # pragma: no cover
-        return _error_payload("unexpected_error", "Unexpected processing failure", str(exc))
-
-
-def process_image(image_path, output_dir):
-    """Backward-compatible adapter for legacy batch workflow."""
-    result = analyze_image(image_path, output_dir)
-    if not result.get("ok"):
-        return None
+    n_all, _, stats_all, _ = cv2.connectedComponentsWithStats(all_mask, connectivity=8)
+    n_black, _, stats_black, _ = cv2.connectedComponentsWithStats(black_mask, connectivity=8)
     return {
-        "image": result["image"],
-        "image_w": result["image_w"],
-        "image_h": result["image_h"],
-        "seed_count": result["seed_count"],
-        "all_seed_area_px": result["all_seed_area_px"],
-        "black_seed_count": result["black_seed_count"],
-        "black_seed_area_px": result["black_seed_area_px"],
-        "all_seed_ratio_pct": result["all_seed_ratio_pct"],
-        "black_seed_ratio_pct": result["black_seed_ratio_pct"],
-        "black_to_all_seed_ratio_pct": result["black_to_all_seed_ratio_pct"],
-        "processing_ms": result["processing_ms"],
+        "size": [w, h],
+        "paper_L": round(paper_l, 1),
+        "all_count": int(max(0, n_all - 1)),
+        "all_area_px": int((all_mask > 0).sum()),
+        "black_count": int(max(0, n_black - 1)),
+        "black_area_px": int((black_mask > 0).sum()),
+        "black_to_all_ratio": round(float((black_mask > 0).sum()) / max(1, int((all_mask > 0).sum())), 4),
+        "leak_blobs": len(leak_blobs),
+        "leak_area_px": int(sum(item["area"] for item in leak_blobs)),
+        "leak_top": leak_blobs[:5],
+        "missed_seed_blobs": len(missed),
+        "missed_seed_area_px": int(sum(item["area"] for item in missed)),
+        "missed_seed_top": missed[:5],
+        "missed_black_blobs": len(missed_black),
+        "missed_black_area_px": int(sum(item["area"] for item in missed_black)),
+        "missed_black_top": missed_black[:8],
+        "black_shadow_like": black_shadow_like[:10],
+        "all_median_component_area": int(np.median(stats_all[1:, cv2.CC_STAT_AREA])) if n_all > 1 else 0,
+        "black_median_component_area": int(np.median(stats_black[1:, cv2.CC_STAT_AREA])) if n_black > 1 else 0,
     }
 
 
-def _collect_images(path: Path):
-    if path.is_file():
-        return [path] if path.suffix.lower() in SUPPORTED_EXTS else []
-    if path.is_dir():
-        return sorted(
-            p for p in path.iterdir()
-            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS and not p.name.startswith(".")
-        )
-    return []
+def bbox_from_stats(stats: np.ndarray, label: int) -> list[int]:
+    return [
+        int(stats[label, cv2.CC_STAT_LEFT]),
+        int(stats[label, cv2.CC_STAT_TOP]),
+        int(stats[label, cv2.CC_STAT_WIDTH]),
+        int(stats[label, cv2.CC_STAT_HEIGHT]),
+    ]
 
 
-def _build_parser():
-    parser = argparse.ArgumentParser(description="Seed segmentation (single file or directory)")
-    parser.add_argument("input", type=str, help="Input file or folder")
-    parser.add_argument("--output", type=str, default=None, help="Output directory")
-    parser.add_argument("--max-pixels", type=int, default=DEFAULT_MAX_PIXELS, help="Max pixels before downscale")
-    parser.add_argument("--max-side", type=int, default=DEFAULT_MAX_SIDE, help="Max image side before downscale")
-    return parser
+def connected_blob_summary(mask_bool: np.ndarray, min_area: int, light: np.ndarray, chroma: np.ndarray | None = None) -> list[dict]:
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask_bool.astype(np.uint8) * 255, connectivity=8)
+    out: list[dict] = []
+    for label in range(1, n):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        comp = labels == label
+        item = {
+            "area": area,
+            "bbox": bbox_from_stats(stats, label),
+            "med_L": round(float(np.median(light[comp])), 1),
+        }
+        if chroma is not None:
+            item["med_chroma"] = round(float(np.median(chroma[comp])), 1)
+        out.append(item)
+    out.sort(key=lambda item: -item["area"])
+    return out
 
 
-def main():
-    args = _build_parser().parse_args()
-    input_path = Path(args.input)
+def image_output_name(input_root: Path, image_path: Path) -> str:
+    rel = image_path.relative_to(input_root).with_suffix("")
+    return "_".join(rel.parts).replace("/", "_")
 
-    if not input_path.exists():
-        print(f"ERROR: input does not exist: {input_path}")
-        return
 
-    if args.output:
-        output_dir = Path(args.output)
-    elif input_path.is_dir():
-        output_dir = input_path / "results"
+def display_name(name: str) -> str:
+    return name.replace("Без Вспышка", "NoFlash").replace("Вспышка", "Flash")
+
+
+def process_image(
+    image_path: Path,
+    input_root: Path,
+    output_dir: Path,
+    do_shading: bool = True,
+    target_short: int = 2400,
+    metrics_only: bool = False,
+) -> dict | None:
+    raw = imread(image_path)
+    if raw is None:
+        print(f"ERROR: cannot read {image_path}")
+        return None
+    stem = image_output_name(input_root, image_path)
+    print(f"[{stem}] {raw.shape[1]}x{raw.shape[0]}")
+
+    paper_full, detect_info = detect_paper_mask(raw)
+    quad = np.array(detect_info["quad"], dtype=np.float32)
+    crop_img, crop_paper, warp_info = warp_to_paper(raw, paper_full, quad)
+    detect_info["warp"] = {"out_size": warp_info["out_size"]}
+    crop = (0, 0, crop_img.shape[1], crop_img.shape[0])
+
+    if target_short > 0:
+        crop_img = resize_short(crop_img, target_short, cv2.INTER_LANCZOS4)
+        crop_paper = resize_short(crop_paper, target_short, cv2.INTER_NEAREST)
+        crop_paper = ((crop_paper > 0).astype(np.uint8)) * 255
+
+    normalized = normalize_scan(crop_img, crop_paper, do_shading=do_shading)
+    normalized = white_balance_to_paper(normalized, crop_paper)
+
+    all_mask, _, all_stats = segment_all_seeds(normalized, crop_paper)
+    black_mask, _, black_stats = segment_black_seeds(normalized, all_mask, crop_paper)
+    all_mask, black_mask, fixup_info = fixup_masks(normalized, crop_paper, all_mask, black_mask)
+
+    # Refresh counts after fixup.
+    all_contours, _ = cv2.findContours(all_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    black_contours, _ = cv2.findContours(black_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    all_stats["seed_count"] = len(all_contours)
+    all_stats["all_seed_area_px"] = int(cv2.countNonZero(all_mask))
+    black_stats["black_seed_count"] = len(black_contours)
+    black_stats["black_seed_area_px"] = int(cv2.countNonZero(black_mask))
+
+    ratio = round(float(black_stats["black_seed_area_px"]) / max(1, int(all_stats["all_seed_area_px"])), 4)
+    if metrics_only:
+        audit = {
+            "size": [int(normalized.shape[1]), int(normalized.shape[0])],
+            "all_count": int(all_stats["seed_count"]),
+            "all_area_px": int(all_stats["all_seed_area_px"]),
+            "black_count": int(black_stats["black_seed_count"]),
+            "black_area_px": int(black_stats["black_seed_area_px"]),
+            "black_to_all_ratio": ratio,
+            "leak_blobs": 0,
+            "leak_area_px": 0,
+            "leak_top": [],
+            "missed_seed_blobs": 0,
+            "missed_seed_area_px": 0,
+            "missed_seed_top": [],
+            "missed_black_blobs": 0,
+            "missed_black_area_px": 0,
+            "missed_black_top": [],
+            "black_shadow_like": [],
+        }
     else:
-        output_dir = input_path.parent / "results"
+        audit = audit_result(normalized, crop_paper, all_mask, black_mask)
+    result = {
+        "image": str(image_path),
+        "name": stem,
+        "input_size": [int(raw.shape[1]), int(raw.shape[0])],
+        "crop": [int(v) for v in crop],
+        "crop_size": [int(normalized.shape[1]), int(normalized.shape[0])],
+        "target_short": int(target_short),
+        "paper_detect": detect_info,
+        "fixup": fixup_info,
+        **all_stats,
+        **black_stats,
+        "white_seed_area_px": int(all_stats["all_seed_area_px"] - black_stats["black_seed_area_px"]),
+        "black_to_all_ratio": audit["black_to_all_ratio"],
+        "audit": audit,
+    }
 
+    if not metrics_only:
+        detect_vis = draw_paper_detect(raw, paper_full, quad)
+        imwrite(output_dir / f"{stem}_paper_detect.jpg", detect_vis, [cv2.IMWRITE_JPEG_QUALITY, 86])
+        imwrite(output_dir / f"{stem}_normalized.jpg", normalized, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        imwrite(output_dir / f"{stem}_paper_mask.png", crop_paper)
+        imwrite(output_dir / f"{stem}_all_mask.png", all_mask)
+        imwrite(output_dir / f"{stem}_black_mask.png", black_mask)
+        imwrite(output_dir / f"{stem}_all_overlay.jpg", visualize_all(normalized, all_mask, all_stats), [cv2.IMWRITE_JPEG_QUALITY, 92])
+        imwrite(output_dir / f"{stem}_black_overlay.jpg", visualize_black(normalized, black_mask, black_stats), [cv2.IMWRITE_JPEG_QUALITY, 92])
+
+    print(
+        f"  crop={crop} all={all_stats['seed_count']} area={all_stats['all_seed_area_px']} "
+        f"black={black_stats['black_seed_count']} area={black_stats['black_seed_area_px']} "
+        f"ratio={audit['black_to_all_ratio']:.4f} "
+        f"missed={audit['missed_seed_blobs']} missed_black={audit['missed_black_blobs']} "
+        f"leaks={audit['leak_blobs']}"
+    )
+    return result
+
+
+def collect_images(input_path: Path, recursive: bool) -> list[Path]:
+    if input_path.is_file():
+        return [input_path]
+    iterator = input_path.rglob("*") if recursive else input_path.iterdir()
+    return sorted(path for path in iterator if path.is_file() and path.suffix.lower() in IMAGE_EXTS and not path.name.startswith("."))
+
+
+def write_contact_sheet(output_dir: Path, rows: list[dict]) -> Path | None:
+    tiles: list[np.ndarray] = []
+    labels: list[str] = []
+    for row in rows:
+        stem = row["name"]
+        all_path = output_dir / f"{stem}_all_overlay.jpg"
+        black_path = output_dir / f"{stem}_black_overlay.jpg"
+        all_img = imread(all_path)
+        black_img = imread(black_path)
+        if all_img is None or black_img is None:
+            continue
+        tile_h = 520
+        all_resized = cv2.resize(all_img, (int(all_img.shape[1] * tile_h / all_img.shape[0]), tile_h), interpolation=cv2.INTER_AREA)
+        black_resized = cv2.resize(black_img, (int(black_img.shape[1] * tile_h / black_img.shape[0]), tile_h), interpolation=cv2.INTER_AREA)
+        tile = np.hstack([all_resized, black_resized])
+        tiles.append(tile)
+        labels.append(display_name(stem))
+    if not tiles:
+        return None
+    target_w = max(tile.shape[1] for tile in tiles)
+    padded: list[np.ndarray] = []
+    for tile, label in zip(tiles, labels):
+        if tile.shape[1] < target_w:
+            pad = np.full((tile.shape[0], target_w - tile.shape[1], 3), 245, dtype=np.uint8)
+            tile = np.hstack([tile, pad])
+        label_bar = np.full((42, target_w, 3), 30, dtype=np.uint8)
+        cv2.putText(label_bar, label, (12, 29), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        padded.append(np.vstack([label_bar, tile]))
+    sheet = np.vstack(padded)
+    path = output_dir / "contact_sheet.jpg"
+    imwrite(path, sheet, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    return path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Paper-masked seed segmentation pipeline v2")
+    parser.add_argument("--input", required=True, help="Input image file or directory")
+    parser.add_argument("--output", required=True, help="Output directory")
+    parser.add_argument("--no-recursive", action="store_true", help="Only process direct children of input directory")
+    parser.add_argument("--no-shading", action="store_true", help="Disable flat-field shading correction")
+    parser.add_argument("--target-short", type=int, default=2400, help="Upscale cropped paper image to this short side before segmentation")
+    parser.add_argument("--metrics-only", action="store_true", help="Only compute JSON area ratios; skip audit images, masks, overlays, and contact sheet")
+    args = parser.parse_args()
+
+    input_path = Path(args.input).resolve()
+    output_dir = Path(args.output).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    images = _collect_images(input_path)
+    input_root = input_path.parent if input_path.is_file() else input_path
+    images = collect_images(input_path, recursive=not args.no_recursive)
     if not images:
-        print("No supported images found")
-        return
+        raise SystemExit("No input images found")
 
-    all_results = []
-    print(f"Found {len(images)} image(s)")
-
-    for img_path in images:
-        result = analyze_image(
-            str(img_path),
-            str(output_dir),
-            max_pixels=args.max_pixels,
-            max_side=args.max_side,
+    print(f"Found {len(images)} images -> {output_dir}")
+    results: list[dict] = []
+    for image in images:
+        row = process_image(
+            image,
+            input_root,
+            output_dir,
+            do_shading=not args.no_shading,
+            target_short=args.target_short,
+            metrics_only=args.metrics_only,
         )
-        all_results.append(result)
-
-        if result.get("ok"):
-            print(
-                f"[{img_path.name}] seeds={result['seed_count']} "
-                f"black={result['black_seed_count']} ms={result['processing_ms']}"
-            )
-        else:
-            err = result.get("error", {})
-            print(f"[{img_path.name}] ERROR {err.get('code')}: {err.get('message')}")
+        if row is not None:
+            results.append(row)
 
     summary_path = output_dir / "summary.json"
-    with summary_path.open("w", encoding="utf-8") as f:
-        json.dump(all_results, f, indent=2, ensure_ascii=False)
+    audit_path = output_dir / "audit.json"
+    summary_min = []
+    audit_rows = []
+    for row in results:
+        audit = {"image": row["name"], "crop": row["crop"], **row["audit"]}
+        audit_rows.append(audit)
+        summary_min.append({
+            "image": row["name"],
+            "crop": row["crop"],
+            "all_count": row["seed_count"],
+            "all_area_px": row["all_seed_area_px"],
+            "black_count": row["black_seed_count"],
+            "black_area_px": row["black_seed_area_px"],
+            "black_to_all_ratio": row["black_to_all_ratio"],
+            "missed_seed_blobs": row["audit"].get("missed_seed_blobs", 0),
+            "missed_black_blobs": row["audit"].get("missed_black_blobs", 0),
+            "leak_blobs": row["audit"].get("leak_blobs", 0),
+            "black_shadow_like": len(row["audit"].get("black_shadow_like", [])),
+        })
+    summary_path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+    audit_path.write_text(json.dumps(audit_rows, indent=2, ensure_ascii=False), encoding="utf-8")
+    sheet_path = None if args.metrics_only else write_contact_sheet(output_dir, results)
 
-    print(f"Summary saved: {summary_path}")
+    print("\nSUMMARY")
+    for row in summary_min:
+        print(
+            f"  {row['image']:18s} all={row['all_count']:4d} black={row['black_count']:4d} "
+            f"missed={row['missed_seed_blobs']:2d} missed_black={row['missed_black_blobs']:2d} "
+            f"leaks={row['leak_blobs']:2d} shadow_like={row['black_shadow_like']:2d}"
+        )
+    print(f"\nsummary: {summary_path}")
+    print(f"audit:   {audit_path}")
+    if sheet_path is not None:
+        print(f"sheet:   {sheet_path}")
 
 
 if __name__ == "__main__":

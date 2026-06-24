@@ -2,10 +2,12 @@ import 'dart:io';
 import 'dart:async';
 
 import 'package:file_picker/file_picker.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
+
+import 'screens/history_screen.dart';
+import 'services/history_service.dart';
 
 const _channel = MethodChannel('seed_detect/analyzer');
 
@@ -62,6 +64,8 @@ class _AnalyzeScreenState extends State<AnalyzeScreen>
   Map<String, dynamic>? _result;
   String? _errorMessage;
   bool _isConsumingSharedInput = false;
+  final HistoryService _historyService = HistoryService();
+  bool _saveFailed = false;
 
   @override
   void initState() {
@@ -295,6 +299,37 @@ class _AnalyzeScreenState extends State<AnalyzeScreen>
     }
   }
 
+  Future<void> _saveToHistory(Map<String, dynamic> result) async {
+    final ok = await _historyService.saveScan(result);
+    if (!mounted) return;
+    if (ok) {
+      setState(() => _saveFailed = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Сохранено в историю')),
+      );
+    } else {
+      setState(() => _saveFailed = true);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('Не удалось сохранить в историю'),
+          action: SnackBarAction(
+            label: 'Повторить',
+            onPressed: () => _saveToHistory(result),
+          ),
+        ),
+      );
+    }
+  }
+
+  void _openHistory() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => HistoryScreen(historyService: _historyService),
+      ),
+    );
+  }
+
   Future<void> _runAnalysis(String inputUri) async {
     setState(() {
       _state = AnalyzeState.processing;
@@ -317,7 +352,9 @@ class _AnalyzeScreenState extends State<AnalyzeScreen>
         setState(() {
           _state = AnalyzeState.done;
           _result = normalized;
+          _saveFailed = false;
         });
+        unawaited(_saveToHistory(normalized));
       } else {
         final message = _localizedErrorMessage(normalized['error']);
         setState(() {
@@ -377,7 +414,16 @@ class _AnalyzeScreenState extends State<AnalyzeScreen>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Seed Detect (офлайн)')),
+      appBar: AppBar(
+        title: const Text('Seed Detect (офлайн)'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.history),
+            tooltip: 'История',
+            onPressed: _openHistory,
+          ),
+        ],
+      ),
       body: SafeArea(
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(16),
@@ -524,6 +570,17 @@ class _AnalyzeScreenState extends State<AnalyzeScreen>
               Text(
                 'Предобработка: изменение размера=${prep['resized']} масштаб=${prep['scale']}',
               ),
+            if (_saveFailed) ...[
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: () => _saveToHistory(result),
+                  icon: const Icon(Icons.save),
+                  label: const Text('Сохранить в историю'),
+                ),
+              ),
+            ],
           ],
         ),
       ),
